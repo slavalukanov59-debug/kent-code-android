@@ -65,6 +65,9 @@ public final class SecureKeyStore {
     public int steps() { return Math.max(1, Math.min(500, prefs.getInt("steps", 40))); }
     public void steps(int count) { prefs.edit().putInt("steps", Math.max(1, Math.min(500, count))).apply(); }
 
+    public boolean bridgeEnabled() { return prefs.getBoolean("termux_bridge_enabled", false); }
+    public void bridgeEnabled(boolean enabled) { prefs.edit().putBoolean("termux_bridge_enabled", enabled).apply(); }
+
     public boolean trustedMode() { return prefs.getBoolean("trusted_mode", false); }
     public void trustedMode(boolean enabled) { prefs.edit().putBoolean("trusted_mode", enabled).apply(); }
 }
