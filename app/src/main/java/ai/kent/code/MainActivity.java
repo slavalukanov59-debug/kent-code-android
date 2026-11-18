@@ -324,11 +324,7 @@ public final class MainActivity extends Activity {
         startActivityForResult(i, REQ_JOURNAL_EXPORT);
     }
 
-    @Override protected void onActivityResult(int request, int resultCode, Intent data) {
-        super.onActivityResult(request, resultCode, data);
-        if (request != REQ_JOURNAL_EXPORT || resultCode != RESULT_OK
-                || data == null || data.getData() == null) return;
-        Uri target = data.getData();
+    private void saveJournalTo(Uri target) {
         executor.submit(() -> {
             try (java.io.OutputStream out = getContentResolver().openOutputStream(target, "w")) {
                 if (out == null) throw new IOException("Не удалось открыть файл экспорта");
@@ -568,6 +564,11 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_JOURNAL_EXPORT) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null)
+                saveJournalTo(data.getData());
+            return;
+        }
         if (requestCode != 100 || resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         String name = "import.txt";
