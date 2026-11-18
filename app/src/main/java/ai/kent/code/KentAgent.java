@@ -23,24 +23,29 @@ public final class KentAgent {
     private static final String API = "https://ai-flex.online/v1/chat/completions";
     private static final String PROMPT =
             "Ты KENT CODE — ИИ-агент для разработки Android. Пиши на русском. " +
-            "Тебе доступны только инструменты чтения, поиска и изменения файлов в изолированной рабочей папке приложения. " +
+            "Тебе доступны инструменты работы с файлами в изолированной рабочей папке приложения. " +
             "Читай код перед правкой, сначала планируй минимальное изменение. " +
             "В доверенном режиме можно изменять файлы рабочей папки без повторных подтверждений. " +
             "Инструмент run_command выполняет команды Android shell только с отдельным подтверждением пользователя. " +
-            "Python и Git могут отсутствовать на Android: проверяй доступность команд. " +
+            "Дополнительно доступны run_termux и run_adb через Termux и Shizuku, только при ручном включении BRIDGE и отдельном одобрении КАЖДОЙ команды. " +
+            "run_termux запускает bash в Termux, Python/Git зависят от установленных пакетов. run_adb выполняет команду через rish с UID shell (НЕ root). " +
+            "Перед выполнением показывай пользователю полный смысл команды; не предлагай секреты/ключи/учётные данные, разрушительные или скрытые действия. " +
+            "Вывод обеих команд может попасть на сервер AI-FLEX в следующем запросе; не считывай приватные данные. " +
             "Никогда не утверждай, что действие выполнено, пока инструмент не подтвердил. " +
             "Не пытайся прочитать API-ключи или секретные файлы. " +
             "Не трогай чужие проекты и не выполняй операции с GitHub самостоятельно.";
 
     private final SafeWorkspace files;
     private final ShellRunner runner;
+    private final TermuxBridge bridge;
     private final SecureKeyStore secrets;
     private final JSONArray history = new JSONArray();
     private final Events events;
 
-    public KentAgent(SafeWorkspace files, SecureKeyStore secrets, Events events) {
+    public KentAgent(SafeWorkspace files, SecureKeyStore secrets, TermuxBridge bridge, Events events) {
         this.files = files;
         this.runner = new ShellRunner(files.root());
+        this.bridge = bridge;
         this.secrets = secrets;
         this.events = events;
         history.put(message("system", PROMPT));
@@ -88,6 +93,10 @@ public final class KentAgent {
                 .put(action("delete_file", "Delete one regular file (confirmation unless trusted mode)", new JSONObject()
                         .put("path", property("string")), "path"))
                 .put(action("run_command", "Run an Android shell command in app workspace. Always requires one-time user approval. Normal app permissions, not root.", new JSONObject()
+                        .put("command", property("string")).put("timeout", property("integer")), "command"))
+                .put(action("run_termux", "Execute shell command in Termux home, including installed Python/Git. Requires BRIDGE enabled, Termux permission and separate user approval EVERY time. Output is returned to model.", new JSONObject()
+                        .put("command", property("string")).put("timeout", property("integer")), "command"))
+                .put(action("run_adb", "Execute an Android adb-shell command via Termux rish and Shizuku; UID=2000, not root. Requires BRIDGE enabled and one-time approval EVERY time. Output is returned to model.", new JSONObject()
                         .put("command", property("string")).put("timeout", property("integer")), "command"));
         } catch (JSONException e) { throw new IllegalStateException(e); }
     }
@@ -228,6 +237,23 @@ public final class KentAgent {
                             + " Не одобряй непонятные команды.\n\n$ " + command;
                     if (!events.approve("▶ Запуск команды — подтвердить", detail)) return "Запуск команды отклонён пользователем";
                     return runner.run(command, seconds, events::cancelled);
+                }
+                case "run_termux":
+                case "run_adb": {
+                    if (!secrets.bridgeEnabled()) return "BRIDGE выключен. Пользователь должен включить его на вкладке BRIDGE.";
+                    String command = args.getString("command");
+                    boolean adb = name.equals("run_adb");
+                    int seconds = Math.max(1, Math.min(120, args.optInt("timeout", 45)));
+                    if (command.isBlank() || command.length() > 5000 || command.indexOf('\0') >= 0)
+                        return "Отклонено: недопустимая команда";
+                    String detail = (adb ? "ADB-SHELL / SHIZUKU (uid=2000, НЕ root)" :
+                            "TERMUX (доступ к домашней папке Termux, Git, Python и файлам)") +
+                            "\nКаждая команда требует ОТДЕЛЬНОГО подтверждения, даже в TRUSTED MODE." +
+                            "\nВНИМАНИЕ: команда может менять приложения и файлы. Вывод будет отправлен модели AI-FLEX." +
+                            "\nНе разрешай команды с неизвестными последствиями или с доступом к секретам.\n\n$ " + command;
+                    if (!events.approve("▶ KENT BRIDGE — разрешить команду?", detail)) return "Команда отклонена пользователем";
+                    return adb ? bridge.runAdb(command, seconds, events::cancelled)
+                            : bridge.runTermux(command, seconds, events::cancelled);
                 }
                 case "delete_file": {
                     String before = files.read(path);
