@@ -93,13 +93,24 @@ public final class MainActivity extends Activity {
                     .setMessage(e.getMessage()).setPositiveButton("Закрыть", (d, w) -> finish()).show();
             return;
         }
-        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.4.0. " +
+        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.4.1. " +
                 "Выбери ИИ-провайдера и модель в CTRL, ключ вводи только там. " +
                 "TRUSTED MODE разрешает автоматическое редактирование файлов рабочей папки. " +
                 "В разделе BRIDGE можно подключить Termux + Shizuku; root не нужен."));
         agent = new KentAgent(workspace, secrets, bridge, localBridge, new KentAgent.Events() {
             @Override public void log(String title, String text) { runOnUiThread(() -> addMessage(title, text)); }
-            @Override public boolean approve(String title, String detail) { return requestApproval(title, detail); }
+            @Override public boolean approve(String title, String detail) {
+                if (stopRequested.get()) return false;
+                if (secrets.autopilotEnabled()) {
+                    // AUTO is explicitly enabled by the owner in CTRL. Show the tool
+                    // request in chat without interrupting the agent with a dialog.
+                    String shown = detail.length() > 700 ? detail.substring(0, 700) +
+                            "\\n[Команда/превью сокращены — весь запрос выполнен]" : detail;
+                    runOnUiThread(() -> addMessage("⚡ AUTO", title + "\\n" + shown));
+                    return !stopRequested.get();
+                }
+                return requestApproval(title, detail);
+            }
             @Override public boolean cancelled() { return stopRequested.get(); }
         });
         draw();
@@ -181,8 +192,10 @@ public final class MainActivity extends Activity {
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.4.0", 20, WHITE, true));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.4.1", 20, WHITE, true));
         padded(head, text("◇ AGENT ONLINE   ◇   " + (secrets.provider().equals("openrouter") ? "OPENROUTER" : "AI-FLEX") + "   ◇   ANDROID", 11, MUTED, false), 3);
+        if (secrets.autopilotEnabled()) padded(head,
+                text("⚡ AUTOPILOT · БЕЗ ПОДТВЕРЖДЕНИЙ · ЖМИ СТОП ДЛЯ ОТМЕНЫ", 11, GOLD, true), 7);
         app.addView(head);
 
         LinearLayout nav = new LinearLayout(this);
@@ -211,8 +224,9 @@ public final class MainActivity extends Activity {
     private void drawChat() {
         LinearLayout statusRow = new LinearLayout(this);
         statusRow.setPadding(dp(16), dp(12), dp(16), dp(9));
-        runStatus = text(running ? "◉ [BUSY] агент работает" : (secrets.trustedMode() ? "◆ [TRUSTED] готов" : "◇ [SAFE] готов"), 12,
-                running ? GOLD : (secrets.trustedMode() ? BLUE : GREEN), true);
+        runStatus = text(running ? "◉ [BUSY] агент работает" : (secrets.autopilotEnabled() ?
+                "⚡ [AUTOPILOT] готов" : (secrets.trustedMode() ? "◆ [TRUSTED] готов" : "◇ [SAFE] готов")), 12,
+                running ? GOLD : (secrets.autopilotEnabled() ? GOLD : (secrets.trustedMode() ? BLUE : GREEN)), true);
         LinearLayout.LayoutParams statusWeight = new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1);
         statusRow.addView(runStatus, statusWeight);
@@ -538,7 +552,7 @@ public final class MainActivity extends Activity {
         padded(content, text("▧ KENT / TERMUX BRIDGE", 20, WHITE, true), 3);
         padded(content, text("Termux → Python, Git, Linux. Shizuku/rish → adb shell (uid=2000, НЕ root). " +
                 "Для Google Play Termux используем локальный защищённый мост. " +
-                "BRIDGE выключен по умолчанию; TRUSTED MODE не отменяет подтверждение команд.", 13, MUTED, false), 9);
+                "BRIDGE выключен по умолчанию; в CTRL можно включить AUTOPILOT, чтобы не подтверждать каждую команду.", 13, MUTED, false), 9);
 
         padded(content, text(bridge.hasPermission()
                 ? "● Разрешение RUN_COMMAND: выдано"
@@ -602,7 +616,7 @@ public final class MainActivity extends Activity {
             new AlertDialog.Builder(this)
                     .setTitle("Включить KENT BRIDGE?")
                     .setMessage("КЕНТ сможет ПРЕДЛАГАТЬ команды для Termux и Shizuku. " +
-                            "Для КАЖДОЙ команды потребуется твоё отдельное подтверждение — даже в TRUSTED MODE. " +
+                            "По умолчанию каждая команда требует подтверждения. AUTOPILOT в CTRL отключает эти окна. " +
                             "Команды могут изменять систему, а их вывод отправляется AI-FLEX. Не одобряй команды с доступом к секретам.")
                     .setPositiveButton("ВКЛЮЧИТЬ", (d, w) -> { secrets.bridgeEnabled(true); draw(); })
                     .setNegativeButton("Отмена", null).show();
@@ -725,8 +739,24 @@ public final class MainActivity extends Activity {
         trusted.setChecked(secrets.trustedMode());
         trusted.setButtonTintList(android.content.res.ColorStateList.valueOf(BLUE));
         padded(content, trusted, 8);
-        padded(content, text("Команды Termux, Shizuku и Android по-прежнему требуют отдельного разрешения. " +
-                "TRUE ROOT, системные разделы и ограничения Android не обходятся.", 12, MUTED, false), 8);
+        padded(content, text("TRUSTED MODE затрагивает только файловые операции. " +
+                "Для отключения ВСЕХ запросов на подтверждение инструментов включи AUTOPILOT ниже.", 12, MUTED, false), 8);
+
+        padded(content, text("⚡ AUTOPILOT — БЕЗ ОКОН ПОДТВЕРЖДЕНИЯ", 15, GOLD, true), 23);
+        CheckBox autopilot = new CheckBox(this);
+        autopilot.setText("Автоматически разрешать ВСЕ инструменты агента (Termux / Shizuku / файлы / shell)");
+        autopilot.setTextColor(WHITE);
+        autopilot.setTypeface(Typeface.MONOSPACE);
+        autopilot.setButtonTintList(android.content.res.ColorStateList.valueOf(GOLD));
+        autopilot.setChecked(secrets.autopilotEnabled());
+        padded(content, autopilot, 10);
+        padded(content, text("⚠ ВНИМАНИЕ: при включении КЕНТ сможет без вопросов запускать команды, " +
+                "удалять или менять файлы, управлять доступными функциями Android и запускать Git. " +
+                "Команды выполняются в пределах прав Termux / Shizuku, а НЕ root. " +
+                "Не отправляй агенту секреты; результаты команд могут уходить ИИ-провайдеру. " +
+                "Все действия отображаются в чате. Кнопка «Стоп» отменяет ожидание, " +
+                "но уже запущенную команду может не остановить. " +
+                "Режим сохраняется после перезапуска, пока не выключишь его здесь.", 12, GOLD, false), 9);
 
         Button save = button("Сохранить настройки", true);
         padded(content, save, 20);
@@ -749,13 +779,14 @@ public final class MainActivity extends Activity {
                 secrets.model(newModel);
                 secrets.steps(maxSteps);
                 secrets.responseTokens(maxTokens);
+                secrets.autopilotEnabled(autopilot.isChecked());
                 if (changed) {
                     agent.clear();
                     messages.clear();
                     addMessage("КЕНТ", "Провайдер изменён. Контекст очищен, локальные файлы сохранены.");
                 }
                 boolean requested = trusted.isChecked();
-                if (requested && !secrets.trustedMode()) {
+                if (requested && !secrets.trustedMode() && !secrets.autopilotEnabled()) {
                     new AlertDialog.Builder(this)
                             .setTitle("☢ Включить TRUSTED MODE?")
                             .setMessage("КЕНТ сможет менять и удалять файлы своей рабочей папки без повторного разрешения. " +
@@ -792,10 +823,10 @@ public final class MainActivity extends Activity {
 
         padded(content, text("▣ RUNNER / PERMISSIONS", 17, WHITE, true), 24);
         padded(content, text("run_command работает с правами KENT CODE. В BRIDGE отдельные права Termux и " +
-                "Shizuku/ADB. Каждая команда требует подтверждения. " +
+                "Shizuku/ADB. Подтверждения инструментов отключены ТОЛЬКО если включён AUTOPILOT. " +
                 "Результаты команд отправляются выбранному ИИ-провайдеру, поэтому не читай секреты. " +
                 "Запросы к платным API могут списывать деньги.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.4.0 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("KENT CODE · Android 0.4.1 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
