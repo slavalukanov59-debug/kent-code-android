@@ -459,8 +459,8 @@ public final class MainActivity extends Activity {
                 "Разрешения → Дополнительные разрешения → Run commands in Termux environment.", 12, MUTED, false), 7);
 
         padded(content, text("2. В Termux разреши внешние команды:", 13, WHITE, true), 18);
-        padded(content, text("mkdir -p ~/.termux\\n" +
-                "printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties\\n" +
+        padded(content, text("mkdir -p ~/.termux\n" +
+                "printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties\n" +
                 "termux-reload-settings", 12, GREEN, false), 7);
         padded(content, text("Используется официальный RUN_COMMAND Intent (Termux >= 0.109). " +
                 "Shizuku должен быть запущен, а ~/rish и ~/rish_shizuku.dex уже настроены. " +
@@ -489,6 +489,12 @@ public final class MainActivity extends Activity {
         Button testAdb = button("▶ Тест Shizuku: id", false);
         padded(content, testAdb, 9);
         testAdb.setOnClickListener(v -> testBridge(true));
+        Button stopBridge = button("■ Остановить ожидание", false);
+        padded(content, stopBridge, 9);
+        stopBridge.setOnClickListener(v -> {
+            stopRequested.set(true);
+            toast("Ожидание отменяется; выполняемая команда в Termux может продолжить работу.");
+        });
         padded(content, text("Последний результат:", 13, MUTED, true), 16);
         padded(content, text(lastBridgeResult, 12, WHITE, false), 7);
         padded(content, text("При зависании кнопка «Стоп» прекращает ожидание, но уже запущенный " +
