@@ -30,8 +30,13 @@ jobs:
       - name: Test file workspace
         run: |
           mkdir -p /tmp/kent-tests
-          javac -d /tmp/kent-tests app/src/main/java/ai/kent/code/SafeWorkspace.java tests/WorkspaceSmokeTest.java
+          javac -d /tmp/kent-tests \
+            app/src/main/java/ai/kent/code/SafeWorkspace.java \
+            app/src/main/java/ai/kent/code/ShellRunner.java \
+            tests/WorkspaceSmokeTest.java \
+            tests/ShellRunnerSmokeTest.java
           java -cp /tmp/kent-tests ai.kent.code.WorkspaceSmokeTest
+          java -cp /tmp/kent-tests ai.kent.code.ShellRunnerSmokeTest
       # ubuntu-latest has the Android SDK command-line tools preinstalled.
       # setup-android@v3 fails currently because it requests the removed 'tools' package.
       - name: Prepare Android SDK 35
