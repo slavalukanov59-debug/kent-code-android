@@ -60,8 +60,62 @@ public final class SecureKeyStore {
         return new String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), StandardCharsets.UTF_8);
     }
 
-    public String model() { return prefs.getString("model", "deepseek-v4.1-flash-1017"); }
-    public void model(String m) { prefs.edit().putString("model", m.trim()).apply(); }
+    public String provider() {
+        // Preserve existing AI-FLEX installs without silently switching their credential.
+        return prefs.getString("ai_provider", prefs.contains("api_key") ? "ai_flex" : "openrouter");
+    }
+
+    public void provider(String id) {
+        if (!id.equals("ai_flex") && !id.equals("openrouter"))
+            throw new IllegalArgumentException("Неподдерживаемый провайдер");
+        prefs.edit().putString("ai_provider", id).apply();
+    }
+
+    public String modelFor(String id) {
+        if (id.equals("openrouter"))
+            return prefs.getString("openrouter_model", "anthropic/claude-sonnet-5.5");
+        return prefs.getString("model", "deepseek-v4.1-flash-1017");
+    }
+
+    public String model() { return modelFor(provider()); }
+    public void model(String m) {
+        prefs.edit().putString(provider().equals("openrouter") ? "openrouter_model" : "model", m.trim()).apply();
+    }
+
+    public String loadActiveKey() throws Exception { return loadProviderKey(provider()); }
+
+    public String loadProviderKey(String id) throws Exception {
+        if (id.equals("ai_flex")) return load(); // existing encrypted key
+        if (!id.equals("openrouter")) throw new IllegalArgumentException("Провайдер не поддерживается");
+        String encrypted = prefs.getString("openrouter_key", "");
+        if (encrypted == null || encrypted.isEmpty()) return "";
+        String[] parts = encrypted.split(":", 2);
+        if (parts.length != 2) throw new IllegalStateException("Неверный ключ OpenRouter");
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128,
+                Base64.decode(parts[0], Base64.NO_WRAP)));
+        return new String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), StandardCharsets.UTF_8);
+    }
+
+    public void saveProviderKey(String id, String value) throws Exception {
+        if (id.equals("ai_flex")) { save(value); return; }
+        if (!id.equals("openrouter")) throw new IllegalArgumentException("Провайдер не поддерживается");
+        if (value == null || value.isBlank()) {
+            prefs.edit().remove("openrouter_key").apply();
+            return;
+        }
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, key());
+        byte[] encrypted = cipher.doFinal(value.trim().getBytes(StandardCharsets.UTF_8));
+        prefs.edit().putString("openrouter_key",
+                Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP) + ":" +
+                Base64.encodeToString(encrypted, Base64.NO_WRAP)).apply();
+    }
+
+    public int responseTokens() { return Math.max(512, Math.min(8192, prefs.getInt("response_tokens", 4096))); }
+    public void responseTokens(int n) { prefs.edit().putInt("response_tokens",
+            Math.max(512, Math.min(8192, n))).apply(); }
+
     public int steps() { return Math.max(1, Math.min(500, prefs.getInt("steps", 40))); }
     public void steps(int count) { prefs.edit().putInt("steps", Math.max(1, Math.min(500, count))).apply(); }
 
