@@ -72,8 +72,10 @@ public final class ChatJournal {
             while ((line = reader.readLine()) != null) {
                 try {
                     JSONObject obj = new JSONObject(line);
-                    result.addLast(new Record(obj.optString("title", "КЕНТ"),
-                            obj.optString("text", "")));
+                    String text = obj.optString("text", "");
+                    if (text.length() > 9000)
+                        text = text.substring(0, 9000) + "\\n[На экране сокращено; полный текст в экспортируемом журнале]";
+                    result.addLast(new Record(obj.optString("title", "КЕНТ"), text));
                     while (result.size() > limit) result.removeFirst();
                 } catch (Exception ignored) {
                     // Incomplete tail after a killed process must not destroy older records.
