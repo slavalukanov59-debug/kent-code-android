@@ -787,8 +787,8 @@ public final class MainActivity extends Activity {
         presets.addView(codePreset, presetMiddle);
         presets.addView(maxPreset, presetLast);
         padded(presetPanel, presets, 7);
-        padded(presetPanel, text("FAST: deepseek-v4.1-flash-1017\\n" +
-                "CODE: claude-sonnet-5-5\\n" +
+        padded(presetPanel, text("FAST: deepseek-v4.1-flash-1017\n" +
+                "CODE: claude-sonnet-5-5\n" +
                 "MAX: claude-opus-5-5", 12, MUTED, false), 7);
         padded(presetPanel, text("Нажатие только подставляет ID в поле выше. " +
                 "Чтобы применить — нажми «Сохранить настройки». " +
