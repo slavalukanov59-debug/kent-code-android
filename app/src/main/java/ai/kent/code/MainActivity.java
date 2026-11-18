@@ -51,6 +51,8 @@ public final class MainActivity extends Activity {
     private SafeWorkspace workspace;
     private SecureKeyStore secrets;
     private KentAgent agent;
+    private TermuxBridge bridge;
+    private String lastBridgeResult = "Проверки ещё не запускались.";
     private LinearLayout app;
     private LinearLayout mainArea;
     private LinearLayout chatFeed;
@@ -74,17 +76,18 @@ public final class MainActivity extends Activity {
         try {
             workspace = new SafeWorkspace(new java.io.File(getFilesDir(), "workspace"));
             secrets = new SecureKeyStore(this);
+            bridge = new TermuxBridge(this);
             if (workspace.filePaths().isEmpty()) workspace.write("hello.py", "def greet(name):\n    return f'Привет, {name}!'\n\nprint(greet('КЕНТ'))\n");
         } catch (Exception e) {
             new AlertDialog.Builder(this).setTitle("Ошибка хранилища")
                     .setMessage(e.getMessage()).setPositiveButton("Закрыть", (d, w) -> finish()).show();
             return;
         }
-        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.2. " +
+        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.3. " +
                 "Нужен новый API-ключ AI-FLEX — добавь в CTRL. " +
                 "TRUSTED MODE разрешает автоматическое редактирование файлов рабочей папки. " +
-                "Команды Android shell доступны после отдельного подтверждения; root и полный Git ещё не встроены."));
-        agent = new KentAgent(workspace, secrets, new KentAgent.Events() {
+                "В разделе BRIDGE можно подключить Termux + Shizuku; root не нужен."));
+        agent = new KentAgent(workspace, secrets, bridge, new KentAgent.Events() {
             @Override public void log(String title, String text) { runOnUiThread(() -> addMessage(title, text)); }
             @Override public boolean approve(String title, String detail) { return requestApproval(title, detail); }
             @Override public boolean cancelled() { return stopRequested.get(); }
@@ -158,14 +161,14 @@ public final class MainActivity extends Activity {
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.2", 20, WHITE, true));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.3", 20, WHITE, true));
         padded(head, text("◇ AGENT ONLINE   ◇   AI-FLEX   ◇   ANDROID", 11, MUTED, false), 3);
         app.addView(head);
 
         LinearLayout nav = new LinearLayout(this);
         nav.setPadding(dp(10), dp(8), dp(10), dp(8));
         nav.setBackgroundColor(Color.rgb(41, 10, 19));
-        String[] labels = {"⌘ CHAT", "▣ FILES", "⚙ CTRL"};
+        String[] labels = {"⌘ CHAT", "▣ FILES", "▧ BRIDGE", "⚙ CTRL"};
         for (int i = 0; i < labels.length; i++) {
             final int selected = i;
             Button b = button(labels[i], i == tab);
@@ -181,7 +184,8 @@ public final class MainActivity extends Activity {
         app.addView(mainArea, area);
         if (tab == 0) drawChat();
         if (tab == 1) drawFiles();
-        if (tab == 2) drawSettings();
+        if (tab == 2) drawBridge();
+        if (tab == 3) drawSettings();
     }
 
     private void drawChat() {
@@ -269,7 +273,7 @@ public final class MainActivity extends Activity {
         if (prompt.isEmpty()) return;
         try {
             if (secrets.load().trim().isEmpty()) {
-                toast("Сначала настрой API-ключ"); tab = 2; draw(); return;
+                toast("Сначала настрой API-ключ"); tab = 3; draw(); return;
             }
         } catch (Exception e) { toast("Ошибка ключа: сбрось его в настройках"); return; }
         composer.setText("");
@@ -427,6 +431,101 @@ public final class MainActivity extends Activity {
         } catch (Exception e) { toast("Импорт: " + e.getMessage()); }
     }
 
+
+    /** Manual opt-in for third-party Termux command bridge. */
+    private void drawBridge() {
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout content = vertical();
+        content.setPadding(dp(16), dp(16), dp(16), dp(24));
+        scroll.addView(content);
+        mainArea.addView(scroll);
+
+        padded(content, text("▧ KENT / TERMUX BRIDGE", 20, WHITE, true), 3);
+        padded(content, text("Termux → Python, Git, Linux. Shizuku/rish → adb shell (uid=2000, НЕ root). " +
+                "BRIDGE выключен по умолчанию; TRUSTED MODE не отменяет подтверждение команд.", 13, MUTED, false), 9);
+
+        padded(content, text(bridge.hasPermission()
+                ? "● Разрешение RUN_COMMAND: выдано"
+                : "○ Разрешение RUN_COMMAND: не выдано", 13,
+                bridge.hasPermission() ? GREEN : GOLD, true), 20);
+
+        Button permission = button("1. Выдать KENT разрешение Termux", true);
+        padded(content, permission, 10);
+        permission.setOnClickListener(v -> {
+            if (bridge.hasPermission()) { toast("Разрешение уже выдано"); return; }
+            requestPermissions(new String[]{TermuxBridge.PERMISSION}, 403);
+        });
+        padded(content, text("Если Android не покажет запрос: Настройки → Приложения → KENT CODE RED → " +
+                "Разрешения → Дополнительные разрешения → Run commands in Termux environment.", 12, MUTED, false), 7);
+
+        padded(content, text("2. В Termux разреши внешние команды:", 13, WHITE, true), 18);
+        padded(content, text("mkdir -p ~/.termux\\n" +
+                "printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties\\n" +
+                "termux-reload-settings", 12, GREEN, false), 7);
+        padded(content, text("Используется официальный RUN_COMMAND Intent (Termux >= 0.109). " +
+                "Shizuku должен быть запущен, а ~/rish и ~/rish_shizuku.dex уже настроены. " +
+                "Если Android блокирует запуск, открой Termux на экране и разреши фоновую работу.", 12, MUTED, false), 10);
+
+        Button toggle = button(secrets.bridgeEnabled() ? "3. ◉ ОТКЛЮЧИТЬ BRIDGE" : "3. ○ ВКЛЮЧИТЬ BRIDGE", true);
+        padded(content, toggle, 16);
+        toggle.setOnClickListener(v -> {
+            if (secrets.bridgeEnabled()) {
+                secrets.bridgeEnabled(false);
+                draw();
+                return;
+            }
+            new AlertDialog.Builder(this)
+                    .setTitle("Включить KENT BRIDGE?")
+                    .setMessage("КЕНТ сможет ПРЕДЛАГАТЬ команды для Termux и Shizuku. " +
+                            "Для КАЖДОЙ команды потребуется твоё отдельное подтверждение — даже в TRUSTED MODE. " +
+                            "Команды могут изменять систему, а их вывод отправляется AI-FLEX. Не одобряй команды с доступом к секретам.")
+                    .setPositiveButton("ВКЛЮЧИТЬ", (d, w) -> { secrets.bridgeEnabled(true); draw(); })
+                    .setNegativeButton("Отмена", null).show();
+        });
+
+        Button testTermux = button("▶ Тест Termux: id", false);
+        padded(content, testTermux, 14);
+        testTermux.setOnClickListener(v -> testBridge(false));
+        Button testAdb = button("▶ Тест Shizuku: id", false);
+        padded(content, testAdb, 9);
+        testAdb.setOnClickListener(v -> testBridge(true));
+        padded(content, text("Последний результат:", 13, MUTED, true), 16);
+        padded(content, text(lastBridgeResult, 12, WHITE, false), 7);
+        padded(content, text("При зависании кнопка «Стоп» прекращает ожидание, но уже запущенный " +
+                "процесс в Termux может продолжить работу. Не запускай долгие процессы, пока не проверим связь.", 12, MUTED, false), 15);
+    }
+
+    private void testBridge(boolean adb) {
+        if (running) { toast("Сначала заверши текущую задачу"); return; }
+        if (!secrets.bridgeEnabled()) { toast("Сначала включи BRIDGE"); return; }
+        if (!bridge.hasPermission()) { toast("Сначала выдай разрешение RUN_COMMAND"); return; }
+        running = true;
+        stopRequested.set(false);
+        lastBridgeResult = adb ? "Проверяем Shizuku…" : "Проверяем Termux…";
+        if (tab == 2) draw();
+        executor.submit(() -> {
+            try {
+                String result = adb ? bridge.runAdb("id", 30, stopRequested::get)
+                                    : bridge.runTermux("id", 30, stopRequested::get);
+                lastBridgeResult = result;
+            } catch (Exception e) {
+                lastBridgeResult = "Ошибка: " + e.getMessage();
+            } finally {
+                running = false;
+                runOnUiThread(() -> { if (tab == 2) draw(); });
+            }
+        });
+    }
+
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode == 403) {
+            toast(bridge.hasPermission() ? "Разрешение Termux получено" :
+                    "Не разрешено. Проверь дополнительные разрешения KENT CODE RED в настройках Android.");
+            if (tab == 2) draw();
+        }
+    }
+
     private void drawSettings() {
         ScrollView scroll = new ScrollView(this);
         LinearLayout content = vertical();
@@ -493,8 +592,8 @@ public final class MainActivity extends Activity {
                     catch (Exception e) { toast(e.getMessage()); } })
                 .setNegativeButton("Отмена", null).show());
         padded(content, text("▣ RUNNER / PERMISSIONS", 17, WHITE, true), 25);
-        padded(content, text("Агент может предложить любую shell-команду Android. Каждая команда показывает полный текст и требует отдельного согласия. Команды работают с правами приложения, НЕ с root. Python и Git в Android не предустановлены. Другие приложения и системные разделы недоступны без соответствующих прав. API-запросы могут стоить денег.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.2 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("Обычный run_command работает с правами KENT CODE, НЕ root. В разделе BRIDGE можно отдельно включить Termux и Shizuku. Там КАЖДАЯ команда требует подтверждения. Ответы инструментов отправляются AI-FLEX; не давай доступ к секретам. API-запросы могут стоить денег.", 13, MUTED, false), 9);
+        padded(content, text("KENT CODE · Android 0.3 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
