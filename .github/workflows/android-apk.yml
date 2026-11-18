@@ -30,10 +30,26 @@ jobs:
           mkdir -p /tmp/kent-tests
           javac -d /tmp/kent-tests app/src/main/java/ai/kent/code/SafeWorkspace.java tests/WorkspaceSmokeTest.java
           java -cp /tmp/kent-tests ai.kent.code.WorkspaceSmokeTest
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
-      - name: Install Android 35
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      # GitHub's ubuntu-latest runner includes Android SDK command-line tools.
+      # The setup-android@v3 action currently fails with: Failed to find package 'tools'.
+      - name: Prepare Android SDK 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK_ROOT/cmdline-tools" ]; then
+            echo "::error::Android SDK command-line tools not found at $SDK_ROOT"
+            exit 1
+          fi
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager executable not found"
+            exit 1
+          fi
+          echo "Using SDK: $SDK_ROOT"
+          echo "Using sdkmanager: $SDKMANAGER"
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses < <(yes) >/dev/null
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" 'platforms;android-35' 'build-tools;35.0.0'
       - name: Compile APK
         run: gradle --no-daemon --stacktrace :app:assembleDebug
       - name: Upload APK
