@@ -27,7 +27,7 @@ public final class KentAgent {
             "Читай код перед правкой, сначала планируй минимальное изменение. " +
             "В доверенном режиме можно изменять файлы рабочей папки без повторных подтверждений. " +
             "Инструмент run_command выполняет команды Android shell только с отдельным подтверждением пользователя. " +
-            "Дополнительно доступны run_termux и run_adb через Termux и Shizuku, только при ручном включении BRIDGE и отдельном одобрении КАЖДОЙ команды. " +
+            "Дополнительно доступны run_termux и run_adb через Termux и Shizuku; это работает только при включенном BRIDGE и отдельном одобрении КАЖДОЙ команды. " +
             "run_termux запускает bash в Termux, Python/Git зависят от установленных пакетов. run_adb выполняет команду через rish с UID shell (НЕ root). " +
             "Перед выполнением показывай пользователю полный смысл команды; не предлагай секреты/ключи/учётные данные, разрушительные или скрытые действия. " +
             "Вывод обеих команд может попасть на сервер AI-FLEX в следующем запросе; не считывай приватные данные. " +
@@ -38,14 +38,16 @@ public final class KentAgent {
     private final SafeWorkspace files;
     private final ShellRunner runner;
     private final TermuxBridge bridge;
+    private final LocalTermuxBridge localBridge;
     private final SecureKeyStore secrets;
     private final JSONArray history = new JSONArray();
     private final Events events;
 
-    public KentAgent(SafeWorkspace files, SecureKeyStore secrets, TermuxBridge bridge, Events events) {
+    public KentAgent(SafeWorkspace files, SecureKeyStore secrets, TermuxBridge bridge, LocalTermuxBridge localBridge, Events events) {
         this.files = files;
         this.runner = new ShellRunner(files.root());
         this.bridge = bridge;
+        this.localBridge = localBridge;
         this.secrets = secrets;
         this.events = events;
         history.put(message("system", PROMPT));
@@ -252,6 +254,10 @@ public final class KentAgent {
                             "\nВНИМАНИЕ: команда может менять приложения и файлы. Вывод будет отправлен модели AI-FLEX." +
                             "\nНе разрешай команды с неизвестными последствиями или с доступом к секретам.\n\n$ " + command;
                     if (!events.approve("▶ KENT BRIDGE — разрешить команду?", detail)) return "Команда отклонена пользователем";
+                    // Google Play Termux omits RUN_COMMAND permission. Use opt-in
+                    // token-authenticated loopback service when configured.
+                    if (localBridge.configured())
+                        return localBridge.run(command, adb, seconds, events::cancelled);
                     return adb ? bridge.runAdb(command, seconds, events::cancelled)
                             : bridge.runTermux(command, seconds, events::cancelled);
                 }
