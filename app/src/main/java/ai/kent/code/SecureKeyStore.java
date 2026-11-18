@@ -149,6 +149,12 @@ public final class SecureKeyStore {
     public boolean bridgeEnabled() { return prefs.getBoolean("termux_bridge_enabled", false); }
     public void bridgeEnabled(boolean enabled) { prefs.edit().putBoolean("termux_bridge_enabled", enabled).apply(); }
 
+    /** Explicit owner opt-in: agent tool approvals are automatic while enabled. */
+    public boolean autopilotEnabled() { return prefs.getBoolean("autopilot_enabled", false); }
+    public void autopilotEnabled(boolean enabled) {
+        prefs.edit().putBoolean("autopilot_enabled", enabled).apply();
+    }
+
     public boolean trustedMode() { return prefs.getBoolean("trusted_mode", false); }
     public void trustedMode(boolean enabled) { prefs.edit().putBoolean("trusted_mode", enabled).apply(); }
 }
