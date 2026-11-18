@@ -65,6 +65,33 @@ public final class SecureKeyStore {
     public int steps() { return Math.max(1, Math.min(500, prefs.getInt("steps", 40))); }
     public void steps(int count) { prefs.edit().putInt("steps", Math.max(1, Math.min(500, count))).apply(); }
 
+    /** Loopback token encrypted with the same AndroidKeystore AES key as API credentials. */
+    public void saveBridgeToken(String value) throws Exception {
+        if (value == null || value.isBlank()) {
+            prefs.edit().remove("bridge_token").apply();
+            return;
+        }
+        if (!value.trim().matches("[0-9a-f]{48}"))
+            throw new IllegalArgumentException("Токен должен содержать 48 символов 0-9/a-f");
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, key());
+        byte[] encrypted = cipher.doFinal(value.trim().getBytes(StandardCharsets.UTF_8));
+        String packed = Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP) + ":" +
+                Base64.encodeToString(encrypted, Base64.NO_WRAP);
+        prefs.edit().putString("bridge_token", packed).apply();
+    }
+
+    public String bridgeToken() throws Exception {
+        String value = prefs.getString("bridge_token", "");
+        if (value == null || value.isEmpty()) return "";
+        String[] parts = value.split(":", 2);
+        if (parts.length != 2) throw new IllegalStateException("Неверный формат токена");
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128,
+                Base64.decode(parts[0], Base64.NO_WRAP)));
+        return new String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), StandardCharsets.UTF_8);
+    }
+
     public boolean bridgeEnabled() { return prefs.getBoolean("termux_bridge_enabled", false); }
     public void bridgeEnabled(boolean enabled) { prefs.edit().putBoolean("termux_bridge_enabled", enabled).apply(); }
 
