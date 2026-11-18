@@ -105,8 +105,8 @@ public final class MainActivity extends Activity {
                     // AUTO is explicitly enabled by the owner in CTRL. Show the tool
                     // request in chat without interrupting the agent with a dialog.
                     String shown = detail.length() > 700 ? detail.substring(0, 700) +
-                            "\\n[Команда/превью сокращены — весь запрос выполнен]" : detail;
-                    runOnUiThread(() -> addMessage("⚡ AUTO", title + "\\n" + shown));
+                            "\n[Команда/превью сокращены — весь запрос выполнен]" : detail;
+                    runOnUiThread(() -> addMessage("⚡ AUTO", title + "\n" + shown));
                     return !stopRequested.get();
                 }
                 return requestApproval(title, detail);
