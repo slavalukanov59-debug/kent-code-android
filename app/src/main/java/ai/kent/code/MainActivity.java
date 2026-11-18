@@ -21,6 +21,9 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.Spinner;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -90,8 +93,8 @@ public final class MainActivity extends Activity {
                     .setMessage(e.getMessage()).setPositiveButton("Закрыть", (d, w) -> finish()).show();
             return;
         }
-        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.3.2. " +
-                "Нужен новый API-ключ AI-FLEX — добавь в CTRL. " +
+        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.4.0. " +
+                "Выбери ИИ-провайдера и модель в CTRL, ключ вводи только там. " +
                 "TRUSTED MODE разрешает автоматическое редактирование файлов рабочей папки. " +
                 "В разделе BRIDGE можно подключить Termux + Shizuku; root не нужен."));
         agent = new KentAgent(workspace, secrets, bridge, localBridge, new KentAgent.Events() {
@@ -178,8 +181,8 @@ public final class MainActivity extends Activity {
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.3.2", 20, WHITE, true));
-        padded(head, text("◇ AGENT ONLINE   ◇   AI-FLEX   ◇   ANDROID", 11, MUTED, false), 3);
+        head.addView(text("█ KENT CODE // RED PIXEL 0.4.0", 20, WHITE, true));
+        padded(head, text("◇ AGENT ONLINE   ◇   " + (secrets.provider().equals("openrouter") ? "OPENROUTER" : "AI-FLEX") + "   ◇   ANDROID", 11, MUTED, false), 3);
         app.addView(head);
 
         LinearLayout nav = new LinearLayout(this);
@@ -289,7 +292,7 @@ public final class MainActivity extends Activity {
         String prompt = composer.getText().toString().trim();
         if (prompt.isEmpty()) return;
         try {
-            if (secrets.load().trim().isEmpty()) {
+            if (secrets.loadActiveKey().trim().isEmpty()) {
                 toast("Сначала настрой API-ключ"); tab = 3; draw(); return;
             }
         } catch (Exception e) { toast("Ошибка ключа: сбрось его в настройках"); return; }
@@ -662,22 +665,55 @@ public final class MainActivity extends Activity {
     private void drawSettings() {
         ScrollView scroll = new ScrollView(this);
         LinearLayout content = vertical();
-        content.setPadding(dp(18), dp(20), dp(18), dp(18));
+        content.setPadding(dp(18), dp(20), dp(18), dp(24));
         scroll.addView(content);
         mainArea.addView(scroll);
+
         padded(content, text("⚙ CONTROL PANEL", 22, WHITE, true), 2);
-        padded(content, text("Ключ хранится локально в зашифрованном виде Android Keystore. " +
-                "Не публикуй API-ключи в GitHub и переписке.", 13, MUTED, false), 8);
-        padded(content, text("🔑 Новый API-ключ (пусто = оставить старый)", 13, MUTED, true), 24);
-        EditText key = field("sk-…", "");
+        padded(content, text("🌐 ИИ-провайдер", 14, BLUE, true), 18);
+        Spinner providers = new Spinner(this);
+        String[] names = {"OpenRouter — Claude / GPT / другие", "AI-FLEX — прежний провайдер"};
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_dropdown_item, names);
+        providers.setAdapter(adapter);
+        providers.setSelection(secrets.provider().equals("openrouter") ? 0 : 1);
+        padded(content, providers, 8);
+        padded(content, text("OpenRouter позволяет выбирать разные модели через один API-ключ. " +
+                "Расходы и ограничения зависят от модели и баланса провайдера. " +
+                "AI-FLEX сохранён для обратной совместимости.", 12, MUTED, false), 8);
+
+        padded(content, text("🔑 API-ключ ВЫБРАННОГО провайдера (пусто = оставить)", 13, MUTED, true), 18);
+        EditText key = field("Вставь ключ только здесь", "");
         key.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        padded(content, key, 7);
-        padded(content, text("🧠 Модель — идентификатор из /v1/models", 13, MUTED, true), 19);
-        EditText model = field("Имя модели", secrets.model());
-        padded(content, model, 7);
-        padded(content, text("Примеры: deepseek-v4.1-flash-1017, deepseek-v4-pro, cn-sonnet-5-5. " +
-                "Доступность и стоимость зависят от AI-FLEX.", 12, MUTED, false), 5);
-        padded(content, text("🔄 Максимум API-шагов (1–500)", 13, MUTED, true), 18);
+        padded(content, key, 6);
+        padded(content, text("API-ключи хранятся раздельно и зашифрованно (Android Keystore). " +
+                "Никогда не вставляй ключ в чат и не публикуй его в GitHub.", 12, MUTED, false), 6);
+
+        padded(content, text("🧠 Модель (точный ID)", 13, MUTED, true), 17);
+        EditText model = field("ID модели", secrets.model());
+        padded(content, model, 6);
+        TextView hint = text("OpenRouter: anthropic/claude-sonnet-5.5, " +
+                "anthropic/claude-opus-5.5, openai/gpt-6-luna. " +
+                "AI-FLEX: укажи ID из каталога провайдера.", 12, MUTED, false);
+        padded(content, hint, 5);
+
+        providers.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                String selected = pos == 0 ? "openrouter" : "ai_flex";
+                model.setText(secrets.modelFor(selected));
+                key.setText("");
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+
+        padded(content, text("📦 Токенов на один ответ (512–8192)", 13, MUTED, true), 17);
+        EditText outputTokens = field("4096", String.valueOf(secrets.responseTokens()));
+        outputTokens.setInputType(InputType.TYPE_CLASS_NUMBER);
+        padded(content, outputTokens, 6);
+        padded(content, text("Увеличение лимита может повысить стоимость ответа. " +
+                "Это не отменяет ограничений модели и API.", 12, MUTED, false), 5);
+
+        padded(content, text("🔄 Максимум API-шагов (1–500)", 13, MUTED, true), 17);
         EditText steps = field("40", String.valueOf(secrets.steps()));
         steps.setInputType(InputType.TYPE_CLASS_NUMBER);
         padded(content, steps, 7);
@@ -689,27 +725,50 @@ public final class MainActivity extends Activity {
         trusted.setChecked(secrets.trustedMode());
         trusted.setButtonTintList(android.content.res.ColorStateList.valueOf(BLUE));
         padded(content, trusted, 8);
-        padded(content, text("По умолчанию выключен. Внутренние файлы приложения и секреты остаются закрытыми. Все shell-команды требуют отдельного согласия.", 12, MUTED, false), 8);
+        padded(content, text("Команды Termux, Shizuku и Android по-прежнему требуют отдельного разрешения. " +
+                "TRUE ROOT, системные разделы и ограничения Android не обходятся.", 12, MUTED, false), 8);
+
         Button save = button("Сохранить настройки", true);
         padded(content, save, 20);
         save.setOnClickListener(v -> {
             if (running) { toast("Дождись завершения задачи"); return; }
             try {
-                if (model.getText().toString().trim().isEmpty()) throw new IOException("Укажи модель");
-                if (!key.getText().toString().trim().isEmpty()) secrets.save(key.getText().toString());
-                secrets.model(model.getText().toString());
-                secrets.steps(Integer.parseInt(steps.getText().toString()));
+                String selected = providers.getSelectedItemPosition() == 0 ? "openrouter" : "ai_flex";
+                String newModel = model.getText().toString().trim();
+                if (newModel.isEmpty()) throw new IOException("Укажи модель");
+                int maxTokens = Integer.parseInt(outputTokens.getText().toString().trim());
+                if (maxTokens < 512 || maxTokens > 8192)
+                    throw new IOException("Токенов должно быть от 512 до 8192");
+                int maxSteps = Integer.parseInt(steps.getText().toString().trim());
+                if (maxSteps < 1 || maxSteps > 500)
+                    throw new IOException("Число API-шагов должно быть 1–500");
+                if (!key.getText().toString().trim().isEmpty())
+                    secrets.saveProviderKey(selected, key.getText().toString());
+                boolean changed = !selected.equals(secrets.provider());
+                secrets.provider(selected);
+                secrets.model(newModel);
+                secrets.steps(maxSteps);
+                secrets.responseTokens(maxTokens);
+                if (changed) {
+                    agent.clear();
+                    messages.clear();
+                    addMessage("КЕНТ", "Провайдер изменён. Контекст очищен, локальные файлы сохранены.");
+                }
                 boolean requested = trusted.isChecked();
                 if (requested && !secrets.trustedMode()) {
                     new AlertDialog.Builder(this)
                             .setTitle("☢ Включить TRUSTED MODE?")
-                            .setMessage("Агент сможет самостоятельно изменять и удалять файлы внутри рабочей папки без вопросов. Это НЕ даёт root и не разрешает запуск команд без согласия. Включить?")
+                            .setMessage("КЕНТ сможет менять и удалять файлы своей рабочей папки без повторного разрешения. " +
+                                    "Команды терминала по-прежнему требуют отдельного согласия. Включить?")
                             .setPositiveButton("ВКЛЮЧИТЬ", (d, w) -> {
                                 secrets.trustedMode(true);
                                 key.setText("");
-                                toast("TRUSTED MODE активирован"); tab = 0; draw();
+                                toast("Настройки сохранены"); tab = 0; draw();
                             })
-                            .setNegativeButton("Отмена", null).show();
+                            .setNegativeButton("Оставить выключенным", (d, w) -> {
+                                key.setText("");
+                                toast("Настройки провайдера сохранены"); tab = 0; draw();
+                            }).show();
                 } else {
                     secrets.trustedMode(requested);
                     key.setText("");
@@ -717,16 +776,26 @@ public final class MainActivity extends Activity {
                 }
             } catch (Exception e) { toast("Ошибка настроек: " + e.getMessage()); }
         });
-        Button clearKey = button("Удалить сохранённый ключ", false);
+
+        Button clearKey = button("Удалить API-ключ выбранного провайдера", false);
         padded(content, clearKey, 11);
         clearKey.setOnClickListener(v -> new AlertDialog.Builder(this)
-                .setTitle("Удалить API-ключ?")
-                .setPositiveButton("Удалить", (d, w) -> { try { secrets.save(""); toast("Ключ удалён"); }
-                    catch (Exception e) { toast(e.getMessage()); } })
+                .setTitle("Удалить ключ выбранного провайдера?")
+                .setPositiveButton("Удалить", (d, w) -> {
+                    try {
+                        String selected = providers.getSelectedItemPosition() == 0 ? "openrouter" : "ai_flex";
+                        secrets.saveProviderKey(selected, "");
+                        toast("Ключ удалён");
+                    } catch (Exception e) { toast("Ошибка: " + e.getMessage()); }
+                })
                 .setNegativeButton("Отмена", null).show());
-        padded(content, text("▣ RUNNER / PERMISSIONS", 17, WHITE, true), 25);
-        padded(content, text("Обычный run_command работает с правами KENT CODE, НЕ root. В разделе BRIDGE можно отдельно включить Termux и Shizuku. Там КАЖДАЯ команда требует подтверждения. Ответы инструментов отправляются AI-FLEX; не давай доступ к секретам. API-запросы могут стоить денег.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.3.2 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+
+        padded(content, text("▣ RUNNER / PERMISSIONS", 17, WHITE, true), 24);
+        padded(content, text("run_command работает с правами KENT CODE. В BRIDGE отдельные права Termux и " +
+                "Shizuku/ADB. Каждая команда требует подтверждения. " +
+                "Результаты команд отправляются выбранному ИИ-провайдеру, поэтому не читай секреты. " +
+                "Запросы к платным API могут списывать деньги.", 13, MUTED, false), 9);
+        padded(content, text("KENT CODE · Android 0.4.0 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
