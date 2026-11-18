@@ -74,7 +74,7 @@ public final class ChatJournal {
                     JSONObject obj = new JSONObject(line);
                     String text = obj.optString("text", "");
                     if (text.length() > 9000)
-                        text = text.substring(0, 9000) + "\\n[На экране сокращено; полный текст в экспортируемом журнале]";
+                        text = text.substring(0, 9000) + "\n[На экране сокращено; полный текст в экспортируемом журнале]";
                     result.addLast(new Record(obj.optString("title", "КЕНТ"), text));
                     while (result.size() > limit) result.removeFirst();
                 } catch (Exception ignored) {
