@@ -1,0 +1,234 @@
+package ai.kent.code;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.json.JSONException;
+
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.OutputStream;
+import java.io.IOException;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+/** Runs exclusively on the Activity's background executor. */
+public final class KentAgent {
+    public interface Events {
+        void log(String title, String message);
+        boolean approve(String title, String detail);
+        boolean cancelled();
+    }
+
+    private static final String API = "https://ai-flex.online/v1/chat/completions";
+    private static final String PROMPT =
+            "Ты KENT CODE — ИИ-агент для разработки Android. Пиши на русском. " +
+            "Тебе доступны только инструменты чтения, поиска и изменения файлов в изолированной рабочей папке приложения. " +
+            "Читай код перед правкой, сначала планируй минимальное изменение. " +
+            "Для записи/редактирования/удаления нужно подтверждение человека. " +
+            "Нет инструмента терминала: не заявляй о запуске тестов или shell-команд. " +
+            "Никогда не утверждай, что действие выполнено, пока инструмент не подтвердил. " +
+            "Не пытайся прочитать API-ключи или секретные файлы. " +
+            "Не трогай чужие проекты и не выполняй операции с GitHub самостоятельно.";
+
+    private final SafeWorkspace files;
+    private final SecureKeyStore secrets;
+    private final JSONArray history = new JSONArray();
+    private final Events events;
+
+    public KentAgent(SafeWorkspace files, SecureKeyStore secrets, Events events) {
+        this.files = files;
+        this.secrets = secrets;
+        this.events = events;
+        history.put(message("system", PROMPT));
+    }
+
+    public void clear() {
+        while (history.length() > 1) history.remove(history.length() - 1);
+    }
+
+    private static JSONObject message(String role, String content) {
+        try { return new JSONObject().put("role", role).put("content", content); }
+        catch (JSONException e) { throw new IllegalStateException(e); }
+    }
+
+    private static JSONObject property(String type) {
+        try { return new JSONObject().put("type", type); }
+        catch (JSONException e) { throw new IllegalStateException(e); }
+    }
+
+    private static JSONObject action(String name, String description, JSONObject properties, String... required) {
+        try {
+            JSONArray requiredNames = new JSONArray();
+            for (String r : required) requiredNames.put(r);
+            JSONObject params = new JSONObject().put("type", "object").put("properties", properties)
+                    .put("required", requiredNames).put("additionalProperties", false);
+            return new JSONObject().put("type", "function")
+                    .put("function", new JSONObject().put("name", name).put("description", description)
+                            .put("parameters", params));
+        } catch (JSONException e) { throw new IllegalStateException(e); }
+    }
+
+    private static JSONArray tools() {
+        try { return new JSONArray()
+                .put(action("list_files", "List project files and folders", new JSONObject()))
+                .put(action("read_file", "Read an existing UTF-8 file in app workspace", new JSONObject()
+                        .put("path", property("string")), "path"))
+                .put(action("search_text", "Find occurrences of text within project files", new JSONObject()
+                        .put("query", property("string")), "query"))
+                .put(action("write_file", "Create or overwrite a UTF-8 file. Requires user confirmation", new JSONObject()
+                        .put("path", property("string")).put("content", property("string")), "path", "content"))
+                .put(action("edit_file", "Replace exact source snippet. Requires user confirmation", new JSONObject()
+                        .put("path", property("string")).put("old_text", property("string"))
+                        .put("new_text", property("string")).put("replace_all", property("boolean")),
+                        "path", "old_text", "new_text"))
+                .put(action("delete_file", "Delete one regular file. Requires user confirmation", new JSONObject()
+                        .put("path", property("string")), "path"));
+        } catch (JSONException e) { throw new IllegalStateException(e); }
+    }
+
+    /** Task is synchronous for background executor. */
+    public void task(String instruction) {
+        if (instruction == null || instruction.trim().isEmpty()) return;
+        history.put(message("user", instruction));
+        int toolActions = 0;
+        for (int n = 0; n < secrets.steps(); n++) {
+            if (events.cancelled()) {
+                events.log("Остановка", "Задача отменена. Уже подтверждённые изменения сохраняются.");
+                return;
+            }
+            try {
+                JSONObject response = request();
+                JSONArray choices = response.optJSONArray("choices");
+                if (choices == null || choices.length() == 0) throw new IOException("API вернул пустой choices");
+                JSONObject message = choices.getJSONObject(0).getJSONObject("message");
+                history.put(new JSONObject(message.toString()));
+                String answer = message.optString("content", "");
+                if (!answer.trim().isEmpty() && !answer.equals("null")) events.log("КЕНТ", answer);
+                JSONArray calls = message.optJSONArray("tool_calls");
+                if (calls == null || calls.length() == 0) {
+                    if (answer.trim().isEmpty()) events.log("КЕНТ", "Пустой ответ модели. Попробуй другую модель.");
+                    return;
+                }
+                for (int i = 0; i < calls.length(); i++) {
+                    JSONObject call = calls.getJSONObject(i);
+                    String id = call.optString("id", "call_" + n + "_" + i);
+                    JSONObject function = call.getJSONObject("function");
+                    String name = function.getString("name");
+                    JSONObject args = new JSONObject(function.optString("arguments", "{}"));
+                    String result = execute(name, args);
+                    toolActions++;
+                    events.log("Инструмент · " + name, result.length() > 2300 ? result.substring(0, 2300) + "\n…" : result);
+                    history.put(new JSONObject().put("role", "tool").put("tool_call_id", id)
+                            .put("content", result));
+                }
+            } catch (Exception e) {
+                String safe = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                events.log("Ошибка API", safe.substring(0, Math.min(1100, safe.length())));
+                return;
+            }
+            if (history.length() > 54) {
+                // Preserve system message but avoid splitting tool-call chains.
+                // Start a fresh conversation on next task instead of corrupting protocol.
+                events.log("Контекст", "История стала длинной. Очисти контекст перед следующей большой задачей.");
+            }
+        }
+        events.log("Лимит шагов", "Достигнут установленный предел API-обращений для задачи (" +
+                secrets.steps() + "). Это защита от непредвиденных расходов. Можно увеличить в настройках.");
+    }
+
+    private JSONObject request() throws Exception {
+        String apiKey = secrets.load();
+        if (apiKey.trim().isEmpty()) throw new IOException("Сначала сохрани новый ключ AI-FLEX в настройках");
+        JSONObject payload = new JSONObject().put("model", secrets.model()).put("messages", history)
+                .put("tools", tools()).put("tool_choice", "auto")
+                .put("max_tokens", 1800);
+        HttpURLConnection connection = (HttpURLConnection) new URL(API).openConnection();
+        connection.setRequestMethod("POST");
+        connection.setConnectTimeout(20_000);
+        connection.setReadTimeout(95_000);
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + apiKey);
+        connection.setRequestProperty("User-Agent", "KENT-CODE-Android/0.1");
+        try {
+            byte[] bytes = payload.toString().getBytes(StandardCharsets.UTF_8);
+            try (OutputStream out = connection.getOutputStream()) { out.write(bytes); }
+            int code = connection.getResponseCode();
+            InputStream stream = code < 400 ? connection.getInputStream() : connection.getErrorStream();
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            if (stream != null) {
+                byte[] chunk = new byte[8192];
+                int size;
+                while ((size = stream.read(chunk)) != -1) {
+                    if (buffer.size() + size > 1_000_000) throw new IOException("Слишком большой ответ API");
+                    buffer.write(chunk, 0, size);
+                }
+            }
+            String body = new String(buffer.toByteArray(), StandardCharsets.UTF_8);
+            if (stream != null) stream.close();
+            if (code != 200) {
+                String detail = body;
+                try {
+                    JSONObject err = new JSONObject(body).optJSONObject("error");
+                    if (err != null) detail = err.optString("message", body);
+                } catch (Exception ignored) {}
+                throw new IOException("HTTP " + code + ": " + detail.substring(0, Math.min(detail.length(), 600)));
+            }
+            return new JSONObject(body);
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private String execute(String name, JSONObject args) {
+        if (events.cancelled()) return "Отклонено: задача отменена";
+        try {
+            String path = args.optString("path", "");
+            switch (name) {
+                case "list_files": return files.tree();
+                case "read_file": return files.read(path);
+                case "search_text": return files.search(args.getString("query"));
+                case "write_file": {
+                    String content = args.getString("content");
+                    String before;
+                    try { before = files.read(path); } catch (IOException e) { before = "<новый файл>"; }
+                    String detail = "Файл: " + path + "\n\nДО:\n" + preview(before)
+                            + "\n\nПОСЛЕ:\n" + preview(content);
+                    if (!events.approve("Разрешить запись файла?", detail)) return "Отклонено пользователем";
+                    files.write(path, content);
+                    return "Записан файл: " + path;
+                }
+                case "edit_file": {
+                    String oldPart = args.getString("old_text");
+                    String newPart = args.getString("new_text");
+                    boolean all = args.optBoolean("replace_all", false);
+                    String before = files.read(path);
+                    String after = files.editPreview(path, oldPart, newPart, all);
+                    if (!events.approve("Разрешить изменение файла?", "Файл: " + path +
+                            "\n\nСТАРЫЙ ФРАГМЕНТ:\n" + preview(oldPart) +
+                            "\n\nНОВЫЙ ФРАГМЕНТ:\n" + preview(newPart))) return "Отклонено пользователем";
+                    // Guard against external modification while dialog was open.
+                    if (!files.read(path).equals(before)) return "Файл изменился во время подтверждения; повтори операцию";
+                    files.write(path, after);
+                    return "Изменён файл: " + path;
+                }
+                case "delete_file": {
+                    String before = files.read(path);
+                    if (!events.approve("Удалить файл?", "НЕОБРАТИМОЕ ДЕЙСТВИЕ\n" + path +
+                            "\n\nСОДЕРЖИМОЕ:\n" + preview(before))) return "Отклонено пользователем";
+                    files.delete(path);
+                    return "Удалён файл: " + path;
+                }
+                default: return "Нет такого инструмента: " + name;
+            }
+        } catch (Exception e) {
+            return "Ошибка инструмента: " + e.getMessage();
+        }
+    }
+
+    private static String preview(String source) {
+        return source.length() <= 3600 ? source : source.substring(0, 3600) + "\n…(превью ограничено 3600 символами)";
+    }
+}

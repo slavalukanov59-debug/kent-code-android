@@ -1,0 +1,45 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - name: Test file workspace
+        run: |
+          mkdir -p /tmp/kent-tests
+          javac -d /tmp/kent-tests app/src/main/java/ai/kent/code/SafeWorkspace.java tests/WorkspaceSmokeTest.java
+          java -cp /tmp/kent-tests ai.kent.code.WorkspaceSmokeTest
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install Android 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Compile APK
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: KENT-CODE-v0.1-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
