@@ -65,10 +65,11 @@ jobs:
           TAG="kent-build-${GITHUB_RUN_NUMBER}"
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -s "$APK"
-          sha256sum "$APK" > app/build/outputs/apk/debug/KENT-CODE-debug.apk.sha256
+          cp "$APK" KENT-CODE-debug.apk
+          sha256sum KENT-CODE-debug.apk > KENT-CODE-debug.apk.sha256
           gh release create "$TAG" \
-            "$APK#KENT-CODE-debug.apk" \
-            "app/build/outputs/apk/debug/KENT-CODE-debug.apk.sha256" \
+            "KENT-CODE-debug.apk" \
+            "KENT-CODE-debug.apk.sha256" \
             --target "$GITHUB_SHA" \
             --title "KENT CODE Android · build #${GITHUB_RUN_NUMBER}" \
             --notes "Experimental debug build. Install on your own device for testing. API key is entered on-device; no key is bundled into the APK." \
