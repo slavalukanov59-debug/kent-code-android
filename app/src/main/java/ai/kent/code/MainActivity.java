@@ -2,16 +2,21 @@ package ai.kent.code;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.Window;
+import android.view.WindowInsets;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -85,7 +90,7 @@ public final class MainActivity extends Activity {
                     .setMessage(e.getMessage()).setPositiveButton("Закрыть", (d, w) -> finish()).show();
             return;
         }
-        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.3.1. " +
+        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.3.2. " +
                 "Нужен новый API-ключ AI-FLEX — добавь в CTRL. " +
                 "TRUSTED MODE разрешает автоматическое редактирование файлов рабочей папки. " +
                 "В разделе BRIDGE можно подключить Termux + Shizuku; root не нужен."));
@@ -159,11 +164,21 @@ public final class MainActivity extends Activity {
     private void draw() {
         app = vertical();
         app.setBackgroundColor(BG);
+        // Target SDK 35+ draws behind status/navigation bars on Android 15+.
+        // Apply system bar and display-cutout insets to the full app root.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            app.setOnApplyWindowInsetsListener((view, windowInsets) -> {
+                Insets bars = windowInsets.getInsets(
+                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+                return windowInsets;
+            });
+        }
         setContentView(app);
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.3.1", 20, WHITE, true));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.3.2", 20, WHITE, true));
         padded(head, text("◇ AGENT ONLINE   ◇   AI-FLEX   ◇   ANDROID", 11, MUTED, false), 3);
         app.addView(head);
 
@@ -292,31 +307,106 @@ public final class MainActivity extends Activity {
         });
     }
 
+    /**
+     * Full-screen approval sheet: long command previews scroll independently
+     * and the DENY / ALLOW buttons are always pinned at the bottom.
+     * Nothing can run unless the user explicitly taps ALLOW.
+     */
     private boolean requestApproval(String title, String detail) {
         if (isFinishing() || stopRequested.get()) return false;
         CountDownLatch latch = new CountDownLatch(1);
         AtomicBoolean approved = new AtomicBoolean(false);
+        final Dialog[] active = new Dialog[1];
+
         runOnUiThread(() -> {
-            if (isFinishing() || stopRequested.get()) { latch.countDown(); return; }
+            if (isFinishing() || isDestroyed() || stopRequested.get()) {
+                latch.countDown();
+                return;
+            }
+            // The content fills the screen, including on very small displays.
+            // Only the preview scrolls; the bottom action bar never scrolls.
+            LinearLayout sheet = vertical();
+            sheet.setBackgroundColor(BG);
+            final int inset = dp(18);
+            sheet.setPadding(inset, inset, inset, inset);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                sheet.setOnApplyWindowInsetsListener((view, windowInsets) -> {
+                    Insets bars = windowInsets.getInsets(
+                            WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                    view.setPadding(inset + bars.left, inset + bars.top,
+                            inset + bars.right, inset + bars.bottom);
+                    return windowInsets;
+                });
+            }
+
+            TextView heading = text("⚠ ПОДТВЕРЖДЕНИЕ ДЕЙСТВИЯ", 18, WHITE, true);
+            padded(sheet, heading, 0);
+            padded(sheet, text(title, 15, BLUE, true), 10);
+            padded(sheet, text("Прочитай полную команду ниже. Разрешение действует ТОЛЬКО один раз.", 
+                    12, MUTED, false), 10);
+
             ScrollView scroll = new ScrollView(this);
+            scroll.setFillViewport(false);
+            scroll.setBackground(shape(PANEL, 3));
             TextView preview = text(detail, 12, WHITE, false);
-            preview.setTypeface(Typeface.MONOSPACE);
-            preview.setPadding(dp(12), dp(10), dp(12), dp(10));
+            preview.setTextIsSelectable(true);
+            preview.setPadding(dp(12), dp(14), dp(12), dp(14));
             scroll.addView(preview);
-            AlertDialog dialog = new AlertDialog.Builder(this)
-                    .setTitle(title)
-                    .setMessage("Проверь файл и содержимое перед разрешением.")
-                    .setView(scroll)
-                    .setPositiveButton("Разрешить один раз", (d, w) -> { approved.set(true); latch.countDown(); })
-                    .setNegativeButton("Запретить", (d, w) -> latch.countDown())
-                    .setOnCancelListener(d -> latch.countDown())
-                    .create();
+            LinearLayout.LayoutParams content = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1);
+            content.topMargin = dp(14);
+            sheet.addView(scroll, content);
+
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            Button deny = button("ОТКЛОНИТЬ", false);
+            Button allow = button("РАЗРЕШИТЬ", true);
+            LinearLayout.LayoutParams left = new LinearLayout.LayoutParams(0, dp(58), 1);
+            LinearLayout.LayoutParams right = new LinearLayout.LayoutParams(0, dp(58), 1);
+            right.leftMargin = dp(10);
+            actions.addView(deny, left);
+            actions.addView(allow, right);
+            LinearLayout.LayoutParams actionParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            actionParams.topMargin = dp(12);
+            sheet.addView(actions, actionParams);
+
+            Dialog dialog = new Dialog(this);
+            active[0] = dialog;
+            dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+            dialog.setContentView(sheet);
+            dialog.setCancelable(true);
+            dialog.setCanceledOnTouchOutside(false);
+            dialog.setOnCancelListener(d -> latch.countDown());
+            dialog.setOnDismissListener(d -> latch.countDown());
+            deny.setOnClickListener(v -> dialog.dismiss());
+            allow.setOnClickListener(v -> {
+                if (!stopRequested.get()) approved.set(true);
+                dialog.dismiss();
+            });
             dialog.show();
-            if (dialog.getWindow() != null) dialog.getWindow().setLayout(
-                    ViewGroup.LayoutParams.MATCH_PARENT, dp(540));
+            Window window = dialog.getWindow();
+            if (window != null) {
+                window.setBackgroundDrawableResource(android.R.color.transparent);
+                window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT);
+                window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
+            }
         });
-        try { latch.await(5, TimeUnit.MINUTES); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        return !stopRequested.get() && approved.get();
+
+        boolean answered = false;
+        try {
+            answered = latch.await(5, TimeUnit.MINUTES);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!answered) {
+            // Never leave a stale dialog that can be approved after the task timed out.
+            runOnUiThread(() -> {
+                if (active[0] != null && active[0].isShowing()) active[0].dismiss();
+            });
+        }
+        return answered && !stopRequested.get() && approved.get();
     }
 
     private void drawFiles() {
@@ -636,7 +726,7 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("Отмена", null).show());
         padded(content, text("▣ RUNNER / PERMISSIONS", 17, WHITE, true), 25);
         padded(content, text("Обычный run_command работает с правами KENT CODE, НЕ root. В разделе BRIDGE можно отдельно включить Termux и Shizuku. Там КАЖДАЯ команда требует подтверждения. Ответы инструментов отправляются AI-FLEX; не давай доступ к секретам. API-запросы могут стоить денег.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.3.1 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("KENT CODE · Android 0.3.2 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
