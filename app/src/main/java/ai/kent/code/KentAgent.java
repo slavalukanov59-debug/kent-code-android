@@ -25,19 +25,22 @@ public final class KentAgent {
             "Ты KENT CODE — ИИ-агент для разработки Android. Пиши на русском. " +
             "Тебе доступны только инструменты чтения, поиска и изменения файлов в изолированной рабочей папке приложения. " +
             "Читай код перед правкой, сначала планируй минимальное изменение. " +
-            "Для записи/редактирования/удаления нужно подтверждение человека. " +
-            "Нет инструмента терминала: не заявляй о запуске тестов или shell-команд. " +
+            "В доверенном режиме можно изменять файлы рабочей папки без повторных подтверждений. " +
+            "Инструмент run_command выполняет команды Android shell только с отдельным подтверждением пользователя. " +
+            "Python и Git могут отсутствовать на Android: проверяй доступность команд. " +
             "Никогда не утверждай, что действие выполнено, пока инструмент не подтвердил. " +
             "Не пытайся прочитать API-ключи или секретные файлы. " +
             "Не трогай чужие проекты и не выполняй операции с GitHub самостоятельно.";
 
     private final SafeWorkspace files;
+    private final ShellRunner runner;
     private final SecureKeyStore secrets;
     private final JSONArray history = new JSONArray();
     private final Events events;
 
     public KentAgent(SafeWorkspace files, SecureKeyStore secrets, Events events) {
         this.files = files;
+        this.runner = new ShellRunner(files.root());
         this.secrets = secrets;
         this.events = events;
         history.put(message("system", PROMPT));
@@ -82,8 +85,10 @@ public final class KentAgent {
                         .put("path", property("string")).put("old_text", property("string"))
                         .put("new_text", property("string")).put("replace_all", property("boolean")),
                         "path", "old_text", "new_text"))
-                .put(action("delete_file", "Delete one regular file. Requires user confirmation", new JSONObject()
-                        .put("path", property("string")), "path"));
+                .put(action("delete_file", "Delete one regular file (confirmation unless trusted mode)", new JSONObject()
+                        .put("path", property("string")), "path"))
+                .put(action("run_command", "Run an Android shell command in app workspace. Always requires one-time user approval. Normal app permissions, not root.", new JSONObject()
+                        .put("command", property("string")).put("timeout", property("integer")), "command"));
         } catch (JSONException e) { throw new IllegalStateException(e); }
     }
 
@@ -196,7 +201,7 @@ public final class KentAgent {
                     try { before = files.read(path); } catch (IOException e) { before = "<новый файл>"; }
                     String detail = "Файл: " + path + "\n\nДО:\n" + preview(before)
                             + "\n\nПОСЛЕ:\n" + preview(content);
-                    if (!events.approve("Разрешить запись файла?", detail)) return "Отклонено пользователем";
+                    if (!secrets.trustedMode() && !events.approve("Разрешить запись файла?", detail)) return "Отклонено пользователем";
                     files.write(path, content);
                     return "Записан файл: " + path;
                 }
@@ -206,7 +211,7 @@ public final class KentAgent {
                     boolean all = args.optBoolean("replace_all", false);
                     String before = files.read(path);
                     String after = files.editPreview(path, oldPart, newPart, all);
-                    if (!events.approve("Разрешить изменение файла?", "Файл: " + path +
+                    if (!secrets.trustedMode() && !events.approve("Разрешить изменение файла?", "Файл: " + path +
                             "\n\nСТАРЫЙ ФРАГМЕНТ:\n" + preview(oldPart) +
                             "\n\nНОВЫЙ ФРАГМЕНТ:\n" + preview(newPart))) return "Отклонено пользователем";
                     // Guard against external modification while dialog was open.
@@ -214,9 +219,19 @@ public final class KentAgent {
                     files.write(path, after);
                     return "Изменён файл: " + path;
                 }
+                case "run_command": {
+                    String command = args.getString("command");
+                    int seconds = Math.max(1, Math.min(120, args.optInt("timeout", 45)));
+                    String detail = "Выполнить shell-команду от имени приложения Android?\n"
+                            + "Папка: " + files.root().getAbsolutePath() + "\n"
+                            + "ВНИМАНИЕ: команда может обращаться к данным приложения, включая сохранённый API-ключ."
+                            + " Не одобряй непонятные команды.\n\n$ " + command;
+                    if (!events.approve("▶ Запуск команды — подтвердить", detail)) return "Запуск команды отклонён пользователем";
+                    return runner.run(command, seconds, events::cancelled);
+                }
                 case "delete_file": {
                     String before = files.read(path);
-                    if (!events.approve("Удалить файл?", "НЕОБРАТИМОЕ ДЕЙСТВИЕ\n" + path +
+                    if (!secrets.trustedMode() && !events.approve("Удалить файл?", "НЕОБРАТИМОЕ ДЕЙСТВИЕ\n" + path +
                             "\n\nСОДЕРЖИМОЕ:\n" + preview(before))) return "Отклонено пользователем";
                     files.delete(path);
                     return "Удалён файл: " + path;

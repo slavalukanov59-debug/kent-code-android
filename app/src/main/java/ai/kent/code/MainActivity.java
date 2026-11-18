@@ -16,6 +16,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -36,14 +37,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Native Android UI. No Termux, root, WebView server or shell dependency. */
 public final class MainActivity extends Activity {
-    private static final int BG = Color.rgb(8, 14, 26);
-    private static final int PANEL = Color.rgb(18, 30, 50);
-    private static final int PANEL_2 = Color.rgb(24, 42, 69);
-    private static final int BLUE = Color.rgb(70, 159, 255);
-    private static final int WHITE = Color.rgb(232, 242, 255);
-    private static final int MUTED = Color.rgb(148, 169, 200);
-    private static final int GOLD = Color.rgb(250, 195, 87);
-    private static final int GREEN = Color.rgb(90, 218, 158);
+    private static final int BG = Color.rgb(14, 5, 9);
+    private static final int PANEL = Color.rgb(35, 11, 19);
+    private static final int PANEL_2 = Color.rgb(63, 17, 28);
+    private static final int BLUE = Color.rgb(255, 78, 103); // red-pixel accent
+    private static final int WHITE = Color.rgb(255, 238, 239);
+    private static final int MUTED = Color.rgb(216, 150, 159);
+    private static final int GOLD = Color.rgb(255, 180, 82);
+    private static final int GREEN = Color.rgb(127, 232, 162);
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean stopRequested = new AtomicBoolean(false);
@@ -79,10 +80,10 @@ public final class MainActivity extends Activity {
                     .setMessage(e.getMessage()).setPositiveButton("Закрыть", (d, w) -> finish()).show();
             return;
         }
-        messages.add(new ChatItem("КЕНТ", "Здарова, братан! Это отдельное Android-приложение. " +
-                "Открой ⚙ Настройки, добавь новый ключ AI-FLEX, затем дай мне задачу. " +
-                "Я могу изучать и редактировать файлы в собственной рабочей папке. " +
-                "Запуск shell-команд и полноценный Git пока не реализованы."));
+        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.2. " +
+                "Нужен новый API-ключ AI-FLEX — добавь в CTRL. " +
+                "TRUSTED MODE разрешает автоматическое редактирование файлов рабочей папки. " +
+                "Команды Android shell доступны после отдельного подтверждения; root и полный Git ещё не встроены."));
         agent = new KentAgent(workspace, secrets, new KentAgent.Events() {
             @Override public void log(String title, String text) { runOnUiThread(() -> addMessage(title, text)); }
             @Override public boolean approve(String title, String detail) { return requestApproval(title, detail); }
@@ -96,8 +97,8 @@ public final class MainActivity extends Activity {
     private GradientDrawable shape(int fill, int radius) {
         GradientDrawable g = new GradientDrawable();
         g.setColor(fill);
-        g.setCornerRadius(dp(radius));
-        g.setStroke(dp(1), Color.rgb(43, 65, 97));
+        g.setCornerRadius(dp(3)); // angular pixel-like panels
+        g.setStroke(dp(1), Color.rgb(147, 38, 61));
         return g;
     }
 
@@ -113,7 +114,7 @@ public final class MainActivity extends Activity {
         t.setTextSize(sp);
         t.setTextColor(color);
         t.setLineSpacing(dp(3), 1.05f);
-        if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        t.setTypeface(Typeface.MONOSPACE, bold ? Typeface.BOLD : Typeface.NORMAL);
         return t;
     }
 
@@ -121,9 +122,10 @@ public final class MainActivity extends Activity {
         Button b = new Button(this);
         b.setText(s);
         b.setAllCaps(false);
-        b.setTextSize(14);
+        b.setTextSize(13);
+        b.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         b.setTextColor(WHITE);
-        b.setBackground(shape(primary ? Color.rgb(16, 113, 244) : PANEL_2, 11));
+        b.setBackground(shape(primary ? Color.rgb(184, 29, 58) : PANEL_2, 3));
         b.setPadding(dp(10), dp(6), dp(10), dp(6));
         return b;
     }
@@ -135,7 +137,8 @@ public final class MainActivity extends Activity {
         f.setHintTextColor(MUTED);
         f.setSingleLine(false);
         f.setTextColor(WHITE);
-        f.setTextSize(15);
+        f.setTextSize(14);
+        f.setTypeface(Typeface.MONOSPACE);
         f.setPadding(dp(12), dp(12), dp(12), dp(12));
         f.setBackground(shape(PANEL, 10));
         return f;
@@ -154,15 +157,15 @@ public final class MainActivity extends Activity {
         setContentView(app);
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
-        head.setBackgroundColor(Color.rgb(14, 23, 39));
-        head.addView(text("⚡ КЕНТ CODE  ·  Android 0.1", 22, WHITE, true));
-        padded(head, text("ИИ-агент для программирования • AI-FLEX", 12, MUTED, false), 2);
+        head.setBackgroundColor(Color.rgb(41, 10, 19));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.2", 20, WHITE, true));
+        padded(head, text("◇ AGENT ONLINE   ◇   AI-FLEX   ◇   ANDROID", 11, MUTED, false), 3);
         app.addView(head);
 
         LinearLayout nav = new LinearLayout(this);
         nav.setPadding(dp(10), dp(8), dp(10), dp(8));
-        nav.setBackgroundColor(Color.rgb(14, 23, 39));
-        String[] labels = {"💬 Чат", "📁 Файлы", "⚙ Настройки"};
+        nav.setBackgroundColor(Color.rgb(41, 10, 19));
+        String[] labels = {"⌘ CHAT", "▣ FILES", "⚙ CTRL"};
         for (int i = 0; i < labels.length; i++) {
             final int selected = i;
             Button b = button(labels[i], i == tab);
@@ -184,8 +187,8 @@ public final class MainActivity extends Activity {
     private void drawChat() {
         LinearLayout statusRow = new LinearLayout(this);
         statusRow.setPadding(dp(16), dp(12), dp(16), dp(9));
-        runStatus = text(running ? "🟡 Агент работает…" : "🟢 Готов к задачам", 13,
-                running ? GOLD : GREEN, true);
+        runStatus = text(running ? "◉ [BUSY] агент работает" : (secrets.trustedMode() ? "◆ [TRUSTED] готов" : "◇ [SAFE] готов"), 12,
+                running ? GOLD : (secrets.trustedMode() ? BLUE : GREEN), true);
         LinearLayout.LayoutParams statusWeight = new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1);
         statusRow.addView(runStatus, statusWeight);
@@ -248,7 +251,7 @@ public final class MainActivity extends Activity {
     private void appendBubble(String who, String message) {
         LinearLayout card = vertical();
         card.setPadding(dp(13), dp(11), dp(13), dp(11));
-        int fill = who.equals("ТЫ") ? Color.rgb(18, 57, 94) : PANEL;
+        int fill = who.equals("ТЫ") ? Color.rgb(73, 18, 35) : PANEL;
         card.setBackground(shape(fill, 13));
         card.addView(text(who, 11, who.startsWith("Ошибка") ? GOLD : BLUE, true));
         padded(card, text(message, 14, WHITE, false), 5);
@@ -430,7 +433,7 @@ public final class MainActivity extends Activity {
         content.setPadding(dp(18), dp(20), dp(18), dp(18));
         scroll.addView(content);
         mainArea.addView(scroll);
-        padded(content, text("⚙ Настройки AI-FLEX", 23, WHITE, true), 2);
+        padded(content, text("⚙ CONTROL PANEL", 22, WHITE, true), 2);
         padded(content, text("Ключ хранится локально в зашифрованном виде Android Keystore. " +
                 "Не публикуй API-ключи в GitHub и переписке.", 13, MUTED, false), 8);
         padded(content, text("🔑 Новый API-ключ (пусто = оставить старый)", 13, MUTED, true), 24);
@@ -442,10 +445,19 @@ public final class MainActivity extends Activity {
         padded(content, model, 7);
         padded(content, text("Примеры: deepseek-v4.1-flash-1017, deepseek-v4-pro, cn-sonnet-5-5. " +
                 "Доступность и стоимость зависят от AI-FLEX.", 12, MUTED, false), 5);
-        padded(content, text("🔄 Максимум API-шагов на задачу (1–100)", 13, MUTED, true), 18);
-        EditText steps = field("12", String.valueOf(secrets.steps()));
+        padded(content, text("🔄 Максимум API-шагов (1–500)", 13, MUTED, true), 18);
+        EditText steps = field("40", String.valueOf(secrets.steps()));
         steps.setInputType(InputType.TYPE_CLASS_NUMBER);
         padded(content, steps, 7);
+        padded(content, text("☢ TRUSTED MODE", 14, BLUE, true), 20);
+        CheckBox trusted = new CheckBox(this);
+        trusted.setText("Автоизменение и удаление файлов БЕЗ подтверждений — только в рабочей папке");
+        trusted.setTextColor(WHITE);
+        trusted.setTypeface(Typeface.MONOSPACE);
+        trusted.setChecked(secrets.trustedMode());
+        trusted.setButtonTintList(android.content.res.ColorStateList.valueOf(BLUE));
+        padded(content, trusted, 8);
+        padded(content, text("По умолчанию выключен. Внутренние файлы приложения и секреты остаются закрытыми. Все shell-команды требуют отдельного согласия.", 12, MUTED, false), 8);
         Button save = button("Сохранить настройки", true);
         padded(content, save, 20);
         save.setOnClickListener(v -> {
@@ -455,9 +467,22 @@ public final class MainActivity extends Activity {
                 if (!key.getText().toString().trim().isEmpty()) secrets.save(key.getText().toString());
                 secrets.model(model.getText().toString());
                 secrets.steps(Integer.parseInt(steps.getText().toString()));
-                key.setText("");
-                toast("Настройки сохранены");
-                tab = 0; draw();
+                boolean requested = trusted.isChecked();
+                if (requested && !secrets.trustedMode()) {
+                    new AlertDialog.Builder(this)
+                            .setTitle("☢ Включить TRUSTED MODE?")
+                            .setMessage("Агент сможет самостоятельно изменять и удалять файлы внутри рабочей папки без вопросов. Это НЕ даёт root и не разрешает запуск команд без согласия. Включить?")
+                            .setPositiveButton("ВКЛЮЧИТЬ", (d, w) -> {
+                                secrets.trustedMode(true);
+                                key.setText("");
+                                toast("TRUSTED MODE активирован"); tab = 0; draw();
+                            })
+                            .setNegativeButton("Отмена", null).show();
+                } else {
+                    secrets.trustedMode(requested);
+                    key.setText("");
+                    toast("Настройки сохранены"); tab = 0; draw();
+                }
             } catch (Exception e) { toast("Ошибка настроек: " + e.getMessage()); }
         });
         Button clearKey = button("Удалить сохранённый ключ", false);
@@ -467,12 +492,9 @@ public final class MainActivity extends Activity {
                 .setPositiveButton("Удалить", (d, w) -> { try { secrets.save(""); toast("Ключ удалён"); }
                     catch (Exception e) { toast(e.getMessage()); } })
                 .setNegativeButton("Отмена", null).show());
-        padded(content, text("🔒 Режим безопасности", 18, WHITE, true), 26);
-        padded(content, text("Изменения файлов требуют отдельного подтверждения. " +
-                "Агент не запускает команды Android и не имеет доступа к другим приложениям. " +
-                "Каждый запрос к AI-FLEX может стоить денег. Ошибки 503/524 зависят от провайдера.",
-                13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android MVP 0.1 · исходники и сборка через GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("▣ RUNNER / PERMISSIONS", 17, WHITE, true), 25);
+        padded(content, text("Агент может предложить любую shell-команду Android. Каждая команда показывает полный текст и требует отдельного согласия. Команды работают с правами приложения, НЕ с root. Python и Git в Android не предустановлены. Другие приложения и системные разделы недоступны без соответствующих прав. API-запросы могут стоить денег.", 13, MUTED, false), 9);
+        padded(content, text("KENT CODE · Android 0.2 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
