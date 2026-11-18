@@ -203,7 +203,7 @@ public final class MainActivity extends Activity {
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.4.2", 20, WHITE, true));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.4.3", 20, WHITE, true));
         padded(head, text("◇ AGENT ONLINE   ◇   " + (secrets.provider().equals("openrouter") ? "OPENROUTER" : "AI-FLEX") + "   ◇   ANDROID", 11, MUTED, false), 3);
         if (secrets.autopilotEnabled()) padded(head,
                 text("⚡ AUTOPILOT · БЕЗ ПОДТВЕРЖДЕНИЙ · ЖМИ СТОП ДЛЯ ОТМЕНЫ", 11, GOLD, true), 7);
@@ -768,6 +768,38 @@ public final class MainActivity extends Activity {
         padded(content, text("🧠 Модель (точный ID)", 13, MUTED, true), 17);
         EditText model = field("ID модели", secrets.model());
         padded(content, model, 6);
+
+        // Safe salvage of the agent's 0.5 patch: presets update only the
+        // visible model ID; they are persisted with the regular Save button.
+        // No extra flag or replacement of existing provider credentials.
+        LinearLayout presetPanel = vertical();
+        padded(presetPanel, text("⚡ Быстрый выбор модели AI-FLEX", 13, BLUE, true), 4);
+        LinearLayout presets = new LinearLayout(this);
+        Button fastPreset = button("⚡ FAST", false);
+        Button codePreset = button("💻 CODE", false);
+        Button maxPreset = button("🔥 MAX", false);
+        LinearLayout.LayoutParams presetFirst = new LinearLayout.LayoutParams(0, dp(48), 1);
+        LinearLayout.LayoutParams presetMiddle = new LinearLayout.LayoutParams(0, dp(48), 1);
+        LinearLayout.LayoutParams presetLast = new LinearLayout.LayoutParams(0, dp(48), 1);
+        presetMiddle.leftMargin = dp(7);
+        presetLast.leftMargin = dp(7);
+        presets.addView(fastPreset, presetFirst);
+        presets.addView(codePreset, presetMiddle);
+        presets.addView(maxPreset, presetLast);
+        padded(presetPanel, presets, 7);
+        padded(presetPanel, text("FAST: deepseek-v4.1-flash-1017\n" +
+                "CODE: claude-sonnet-5-5\n" +
+                "MAX: claude-opus-5-5", 12, MUTED, false), 7);
+        padded(presetPanel, text("Нажатие только подставляет ID в поле выше. " +
+                "Чтобы применить — нажми «Сохранить настройки». " +
+                "MAX обычно существенно дороже; стоимость и доступность проверяй в AI-FLEX.", 12, MUTED, false), 6);
+        padded(content, presetPanel, 10);
+        fastPreset.setOnClickListener(v -> model.setText("deepseek-v4.1-flash-1017"));
+        codePreset.setOnClickListener(v -> model.setText("claude-sonnet-5-5"));
+        maxPreset.setOnClickListener(v -> model.setText("claude-opus-5-5"));
+        presetPanel.setVisibility(secrets.provider().equals("ai_flex") ?
+                View.VISIBLE : View.GONE);
+
         TextView hint = text("OpenRouter: anthropic/claude-sonnet-5.5, " +
                 "anthropic/claude-opus-5.5, openai/gpt-6-luna. " +
                 "AI-FLEX: укажи ID из каталога провайдера.", 12, MUTED, false);
@@ -777,6 +809,8 @@ public final class MainActivity extends Activity {
             @Override public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
                 String selected = pos == 0 ? "openrouter" : "ai_flex";
                 model.setText(secrets.modelFor(selected));
+                presetPanel.setVisibility(selected.equals("ai_flex") ?
+                        View.VISIBLE : View.GONE);
                 key.setText("");
             }
             @Override public void onNothingSelected(AdapterView<?> parent) {}
@@ -900,7 +934,7 @@ public final class MainActivity extends Activity {
                 "Shizuku/ADB. Подтверждения инструментов отключены ТОЛЬКО если включён AUTOPILOT. " +
                 "Результаты команд отправляются выбранному ИИ-провайдеру, поэтому не читай секреты. " +
                 "Запросы к платным API могут списывать деньги.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.4.2 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("KENT CODE · Android 0.4.3 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
