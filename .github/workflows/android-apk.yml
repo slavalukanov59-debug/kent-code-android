@@ -6,8 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Required to publish a downloadable APK as a GitHub Release.
+# Actions artifact storage quota is currently exhausted for this account.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -30,8 +32,8 @@ jobs:
           mkdir -p /tmp/kent-tests
           javac -d /tmp/kent-tests app/src/main/java/ai/kent/code/SafeWorkspace.java tests/WorkspaceSmokeTest.java
           java -cp /tmp/kent-tests ai.kent.code.WorkspaceSmokeTest
-      # GitHub's ubuntu-latest runner includes Android SDK command-line tools.
-      # The setup-android@v3 action currently fails with: Failed to find package 'tools'.
+      # ubuntu-latest has the Android SDK command-line tools preinstalled.
+      # setup-android@v3 fails currently because it requests the removed 'tools' package.
       - name: Prepare Android SDK 35
         shell: bash
         run: |
@@ -47,15 +49,27 @@ jobs:
             exit 1
           fi
           echo "Using SDK: $SDK_ROOT"
-          echo "Using sdkmanager: $SDKMANAGER"
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses < <(yes) >/dev/null
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" 'platforms;android-35' 'build-tools;35.0.0'
       - name: Compile APK
         run: gradle --no-daemon --stacktrace :app:assembleDebug
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: KENT-CODE-v0.1-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 30
+      # No upload-artifact: GitHub has reported the Actions storage quota is full.
+      # PRs still compile and test, main builds are published via Releases.
+      - name: Publish downloadable APK to GitHub Releases
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="kent-build-${GITHUB_RUN_NUMBER}"
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          sha256sum "$APK" > app/build/outputs/apk/debug/KENT-CODE-debug.apk.sha256
+          gh release create "$TAG" \
+            "$APK#KENT-CODE-debug.apk" \
+            "app/build/outputs/apk/debug/KENT-CODE-debug.apk.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "KENT CODE Android · build #${GITHUB_RUN_NUMBER}" \
+            --notes "Experimental debug build. Install on your own device for testing. API key is entered on-device; no key is bundled into the APK." \
+            --prerelease
