@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+    <queries><package android:name="com.termux" /></queries>
     <application
         android:allowBackup="false"
         android:usesCleartextTraffic="false"
@@ -8,6 +10,7 @@
         android:icon="@drawable/ic_kent"
         android:theme="@style/KentTheme"
         android:supportsRtl="true">
+        <service android:name=".TermuxResultService" android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
