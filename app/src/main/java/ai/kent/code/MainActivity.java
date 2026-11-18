@@ -52,6 +52,7 @@ public final class MainActivity extends Activity {
     private SecureKeyStore secrets;
     private KentAgent agent;
     private TermuxBridge bridge;
+    private LocalTermuxBridge localBridge;
     private String lastBridgeResult = "Проверки ещё не запускались.";
     private LinearLayout app;
     private LinearLayout mainArea;
@@ -77,17 +78,18 @@ public final class MainActivity extends Activity {
             workspace = new SafeWorkspace(new java.io.File(getFilesDir(), "workspace"));
             secrets = new SecureKeyStore(this);
             bridge = new TermuxBridge(this);
+            localBridge = new LocalTermuxBridge(secrets);
             if (workspace.filePaths().isEmpty()) workspace.write("hello.py", "def greet(name):\n    return f'Привет, {name}!'\n\nprint(greet('КЕНТ'))\n");
         } catch (Exception e) {
             new AlertDialog.Builder(this).setTitle("Ошибка хранилища")
                     .setMessage(e.getMessage()).setPositiveButton("Закрыть", (d, w) -> finish()).show();
             return;
         }
-        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.3. " +
+        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.3.1. " +
                 "Нужен новый API-ключ AI-FLEX — добавь в CTRL. " +
                 "TRUSTED MODE разрешает автоматическое редактирование файлов рабочей папки. " +
                 "В разделе BRIDGE можно подключить Termux + Shizuku; root не нужен."));
-        agent = new KentAgent(workspace, secrets, bridge, new KentAgent.Events() {
+        agent = new KentAgent(workspace, secrets, bridge, localBridge, new KentAgent.Events() {
             @Override public void log(String title, String text) { runOnUiThread(() -> addMessage(title, text)); }
             @Override public boolean approve(String title, String detail) { return requestApproval(title, detail); }
             @Override public boolean cancelled() { return stopRequested.get(); }
@@ -161,7 +163,7 @@ public final class MainActivity extends Activity {
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.3", 20, WHITE, true));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.3.1", 20, WHITE, true));
         padded(head, text("◇ AGENT ONLINE   ◇   AI-FLEX   ◇   ANDROID", 11, MUTED, false), 3);
         app.addView(head);
 
@@ -442,6 +444,7 @@ public final class MainActivity extends Activity {
 
         padded(content, text("▧ KENT / TERMUX BRIDGE", 20, WHITE, true), 3);
         padded(content, text("Termux → Python, Git, Linux. Shizuku/rish → adb shell (uid=2000, НЕ root). " +
+                "Для Google Play Termux используем локальный защищённый мост. " +
                 "BRIDGE выключен по умолчанию; TRUSTED MODE не отменяет подтверждение команд.", 13, MUTED, false), 9);
 
         padded(content, text(bridge.hasPermission()
@@ -465,6 +468,35 @@ public final class MainActivity extends Activity {
         padded(content, text("Используется официальный RUN_COMMAND Intent (Termux >= 0.109). " +
                 "Shizuku должен быть запущен, а ~/rish и ~/rish_shizuku.dex уже настроены. " +
                 "Если Android блокирует запуск, открой Termux на экране и разреши фоновую работу.", 12, MUTED, false), 10);
+
+        padded(content, text("▣ Google Play Termux — без RUN_COMMAND", 15, WHITE, true), 20);
+        padded(content, text("Твоя сборка Termux из Google Play не регистрирует разрешение RUN_COMMAND. " +
+                "Вместо него запусти в Termux локальный сервер вручную:", 12, MUTED, false), 7);
+        padded(content, text("cd ~/KENT-CODE-Android\n" +
+                "git pull --ff-only\n" +
+                "pkg install python -y\n" +
+                "python tools/kent_bridge_server.py", 12, GREEN, false), 10);
+        padded(content, text("Оставь Termux с запущенным сервером. Он слушает ТОЛЬКО 127.0.0.1:47883 " +
+                "и выдаёт случайный токен. Не отправляй токен в чат, в GitHub или третьим лицам. " +
+                "Вставь токен ниже (хранится зашифрованно в Android Keystore).", 12, MUTED, false), 10);
+        padded(content, text(localBridge.configured() ?
+                "● Локальный токен сохранён" : "○ Локальный токен не задан",
+                13, localBridge.configured() ? GREEN : GOLD, true), 9);
+        EditText tokenInput = field("Вставь 48 символов токена", "");
+        tokenInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        padded(content, tokenInput, 10);
+        Button saveToken = button("Сохранить токен локального моста", false);
+        padded(content, saveToken, 8);
+        saveToken.setOnClickListener(v -> {
+            try {
+                secrets.saveBridgeToken(tokenInput.getText().toString().trim());
+                tokenInput.setText("");
+                toast("Токен сохранён локально");
+                draw();
+            } catch (Exception e) {
+                toast("Ошибка токена: " + e.getMessage());
+            }
+        });
 
         Button toggle = button(secrets.bridgeEnabled() ? "3. ◉ ОТКЛЮЧИТЬ BRIDGE" : "3. ○ ВКЛЮЧИТЬ BRIDGE", true);
         padded(content, toggle, 16);
@@ -504,15 +536,20 @@ public final class MainActivity extends Activity {
     private void testBridge(boolean adb) {
         if (running) { toast("Сначала заверши текущую задачу"); return; }
         if (!secrets.bridgeEnabled()) { toast("Сначала включи BRIDGE"); return; }
-        if (!bridge.hasPermission()) { toast("Сначала выдай разрешение RUN_COMMAND"); return; }
+        if (!bridge.hasPermission() && !localBridge.configured()) { toast("Нужен локальный токен или RUN_COMMAND"); return; }
         running = true;
         stopRequested.set(false);
         lastBridgeResult = adb ? "Проверяем Shizuku…" : "Проверяем Termux…";
         if (tab == 2) draw();
         executor.submit(() -> {
             try {
-                String result = adb ? bridge.runAdb("id", 30, stopRequested::get)
-                                    : bridge.runTermux("id", 30, stopRequested::get);
+                String result;
+                if (localBridge.configured()) {
+                    result = localBridge.run("id", adb, 30, stopRequested::get);
+                } else {
+                    result = adb ? bridge.runAdb("id", 30, stopRequested::get)
+                                 : bridge.runTermux("id", 30, stopRequested::get);
+                }
                 lastBridgeResult = result;
             } catch (Exception e) {
                 lastBridgeResult = "Ошибка: " + e.getMessage();
@@ -599,7 +636,7 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("Отмена", null).show());
         padded(content, text("▣ RUNNER / PERMISSIONS", 17, WHITE, true), 25);
         padded(content, text("Обычный run_command работает с правами KENT CODE, НЕ root. В разделе BRIDGE можно отдельно включить Termux и Shizuku. Там КАЖДАЯ команда требует подтверждения. Ответы инструментов отправляются AI-FLEX; не давай доступ к секретам. API-запросы могут стоить денег.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.3 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("KENT CODE · Android 0.3.1 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
