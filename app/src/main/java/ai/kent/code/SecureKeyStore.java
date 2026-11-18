@@ -116,6 +116,15 @@ public final class SecureKeyStore {
     public void responseTokens(int n) { prefs.edit().putInt("response_tokens",
             Math.max(512, Math.min(8192, n))).apply(); }
 
+    /** Soft limit counted from API usage when available, conservatively estimated otherwise. */
+    public int taskTokenBudget() {
+        return Math.max(10_000, Math.min(300_000, prefs.getInt("task_token_budget", 80_000)));
+    }
+    public void taskTokenBudget(int tokens) {
+        prefs.edit().putInt("task_token_budget",
+                Math.max(10_000, Math.min(300_000, tokens))).apply();
+    }
+
     public int steps() { return Math.max(1, Math.min(500, prefs.getInt("steps", 40))); }
     public void steps(int count) { prefs.edit().putInt("steps", Math.max(1, Math.min(500, count))).apply(); }
 

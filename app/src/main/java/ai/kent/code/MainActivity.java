@@ -61,6 +61,9 @@ public final class MainActivity extends Activity {
     private KentAgent agent;
     private TermuxBridge bridge;
     private LocalTermuxBridge localBridge;
+    private ChatJournal journal;
+    private static final int REQ_JOURNAL_EXPORT = 742;
+    private static final int RECENT_CHAT_LIMIT = 120;
     private String lastBridgeResult = "Проверки ещё не запускались.";
     private LinearLayout app;
     private LinearLayout mainArea;
@@ -85,6 +88,7 @@ public final class MainActivity extends Activity {
         try {
             workspace = new SafeWorkspace(new java.io.File(getFilesDir(), "workspace"));
             secrets = new SecureKeyStore(this);
+            journal = new ChatJournal(this);
             bridge = new TermuxBridge(this);
             localBridge = new LocalTermuxBridge(secrets);
             if (workspace.filePaths().isEmpty()) workspace.write("hello.py", "def greet(name):\n    return f'Привет, {name}!'\n\nprint(greet('КЕНТ'))\n");
@@ -93,10 +97,17 @@ public final class MainActivity extends Activity {
                     .setMessage(e.getMessage()).setPositiveButton("Закрыть", (d, w) -> finish()).show();
             return;
         }
-        messages.add(new ChatItem("КЕНТ", "Здарова! Встречай KENT CODE // RED PIXEL 0.4.1. " +
-                "Выбери ИИ-провайдера и модель в CTRL, ключ вводи только там. " +
-                "TRUSTED MODE разрешает автоматическое редактирование файлов рабочей папки. " +
-                "В разделе BRIDGE можно подключить Termux + Shizuku; root не нужен."));
+        for (ChatJournal.Record record : journal.recent(RECENT_CHAT_LIMIT)) {
+            messages.add(new ChatItem(record.title, record.text));
+        }
+        if (messages.isEmpty()) {
+            addMessage("КЕНТ", "KENT CODE 0.4.2. Журнал сообщений теперь сохраняется на устройстве. " +
+                    "BRIDGE и модель выбираются в настройках.");
+        } else {
+            addMessage("СЕССИЯ", "История чата восстановлена из локального журнала. " +
+                    "После перезапуска модель НЕ помнит прежние обращения: чтобы продолжить работу, " +
+                    "попроси её проверить git status / PROGRESS.md. Файлы проекта не очищались.");
+        }
         agent = new KentAgent(workspace, secrets, bridge, localBridge, new KentAgent.Events() {
             @Override public void log(String title, String text) { runOnUiThread(() -> addMessage(title, text)); }
             @Override public boolean approve(String title, String detail) {
@@ -192,7 +203,7 @@ public final class MainActivity extends Activity {
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.4.1", 20, WHITE, true));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.4.2", 20, WHITE, true));
         padded(head, text("◇ AGENT ONLINE   ◇   " + (secrets.provider().equals("openrouter") ? "OPENROUTER" : "AI-FLEX") + "   ◇   ANDROID", 11, MUTED, false), 3);
         if (secrets.autopilotEnabled()) padded(head,
                 text("⚡ AUTOPILOT · БЕЗ ПОДТВЕРЖДЕНИЙ · ЖМИ СТОП ДЛЯ ОТМЕНЫ", 11, GOLD, true), 7);
@@ -249,10 +260,27 @@ public final class MainActivity extends Activity {
         Button clear = button("Очистить диалог", false);
         clear.setOnClickListener(v -> {
             if (running) { toast("Сначала останови текущую задачу"); return; }
-            agent.clear(); messages.clear();
-            addMessage("КЕНТ", "Контекст очищен. Файлы проекта не затронуты.");
+            new AlertDialog.Builder(this)
+                    .setTitle("Удалить историю диалога?")
+                    .setMessage("Локальный журнал также будет удалён. Сначала экспортируй его, " +
+                            "если хочешь сохранить отчёты. Код проекта не изменится.")
+                    .setNegativeButton("Отмена", null)
+                    .setPositiveButton("Очистить", (d, w) -> {
+                        try {
+                            journal.clear();
+                            agent.clear();
+                            messages.clear();
+                            chatFeed.removeAllViews();
+                            addMessage("КЕНТ", "Контекст и журнал очищены. Файлы проекта не затронуты.");
+                        } catch (IOException e) { toast("Ошибка журнала: " + e.getMessage()); }
+                    }).show();
         });
-        actions.addView(clear);
+        actions.addView(clear, new LinearLayout.LayoutParams(0, dp(48), 1));
+        Button export = button("⇩ Журнал", false);
+        LinearLayout.LayoutParams exportLp = new LinearLayout.LayoutParams(0, dp(48), 1);
+        exportLp.leftMargin = dp(8);
+        actions.addView(export, exportLp);
+        export.setOnClickListener(v -> exportJournal());
         mainArea.addView(actions);
 
         LinearLayout sendRow = new LinearLayout(this);
@@ -272,11 +300,40 @@ public final class MainActivity extends Activity {
     }
 
     private void addMessage(String who, String message) {
-        messages.add(new ChatItem(who, message));
+        if (journal != null) {
+            try { journal.append(who, message); }
+            catch (IOException e) { android.util.Log.w("KENT", "Журнал недоступен", e); }
+        }
+        String display = message.length() > 9000
+                ? message.substring(0, 9000) + "\n[На экране сокращено; полный текст — в журнале]"
+                : message;
+        messages.add(new ChatItem(who, display));
+        while (messages.size() > RECENT_CHAT_LIMIT) messages.remove(0);
         if (tab == 0 && chatFeed != null) {
-            appendBubble(who, message);
+            appendBubble(who, display);
+            while (chatFeed.getChildCount() > RECENT_CHAT_LIMIT) chatFeed.removeViewAt(0);
             if (chatScroll != null) chatScroll.post(() -> chatScroll.fullScroll(View.FOCUS_DOWN));
         }
+    }
+
+    private void exportJournal() {
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/json");
+        i.putExtra(Intent.EXTRA_TITLE, "KENT-chat-journal.jsonl");
+        startActivityForResult(i, REQ_JOURNAL_EXPORT);
+    }
+
+    private void saveJournalTo(Uri target) {
+        executor.submit(() -> {
+            try (java.io.OutputStream out = getContentResolver().openOutputStream(target, "w")) {
+                if (out == null) throw new IOException("Не удалось открыть файл экспорта");
+                journal.export(out);
+                runOnUiThread(() -> toast("Журнал экспортирован. Не публикуй секреты из чата."));
+            } catch (Exception e) {
+                runOnUiThread(() -> toast("Не удалось экспортировать: " + e.getMessage()));
+            }
+        });
     }
 
     private void redrawFeed() {
@@ -507,6 +564,11 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_JOURNAL_EXPORT) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null)
+                saveJournalTo(data.getData());
+            return;
+        }
         if (requestCode != 100 || resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         String name = "import.txt";
@@ -727,6 +789,14 @@ public final class MainActivity extends Activity {
         padded(content, text("Увеличение лимита может повысить стоимость ответа. " +
                 "Это не отменяет ограничений модели и API.", 12, MUTED, false), 5);
 
+        padded(content, text("💰 Лимит токенов на задачу (10 000–300 000)", 13, GOLD, true), 17);
+        EditText tokenBudget = field("80000", String.valueOf(secrets.taskTokenBudget()));
+        tokenBudget.setInputType(InputType.TYPE_CLASS_NUMBER);
+        padded(content, tokenBudget, 6);
+        padded(content, text("Защита от повторной отправки длинного контекста. " +
+                "Учитывается usage из API, либо приблизительная оценка. " +
+                "Проверяй реальный расход в AI-FLEX: лимит приблизительный.", 12, MUTED, false), 5);
+
         padded(content, text("🔄 Максимум API-шагов (1–500)", 13, MUTED, true), 17);
         EditText steps = field("40", String.valueOf(secrets.steps()));
         steps.setInputType(InputType.TYPE_CLASS_NUMBER);
@@ -769,6 +839,9 @@ public final class MainActivity extends Activity {
                 int maxTokens = Integer.parseInt(outputTokens.getText().toString().trim());
                 if (maxTokens < 512 || maxTokens > 8192)
                     throw new IOException("Токенов должно быть от 512 до 8192");
+                int requestedBudget = Integer.parseInt(tokenBudget.getText().toString().trim());
+                if (requestedBudget < 10_000 || requestedBudget > 300_000)
+                    throw new IOException("Лимит токенов должен быть 10000–300000");
                 int maxSteps = Integer.parseInt(steps.getText().toString().trim());
                 if (maxSteps < 1 || maxSteps > 500)
                     throw new IOException("Число API-шагов должно быть 1–500");
@@ -778,6 +851,7 @@ public final class MainActivity extends Activity {
                 secrets.provider(selected);
                 secrets.model(newModel);
                 secrets.steps(maxSteps);
+                secrets.taskTokenBudget(requestedBudget);
                 secrets.responseTokens(maxTokens);
                 secrets.autopilotEnabled(autopilot.isChecked());
                 if (changed) {
@@ -826,7 +900,7 @@ public final class MainActivity extends Activity {
                 "Shizuku/ADB. Подтверждения инструментов отключены ТОЛЬКО если включён AUTOPILOT. " +
                 "Результаты команд отправляются выбранному ИИ-провайдеру, поэтому не читай секреты. " +
                 "Запросы к платным API могут списывать деньги.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.4.1 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("KENT CODE · Android 0.4.2 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
