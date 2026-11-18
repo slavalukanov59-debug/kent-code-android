@@ -304,10 +304,13 @@ public final class MainActivity extends Activity {
             try { journal.append(who, message); }
             catch (IOException e) { android.util.Log.w("KENT", "Журнал недоступен", e); }
         }
-        messages.add(new ChatItem(who, message));
+        String display = message.length() > 9000
+                ? message.substring(0, 9000) + "\\n[На экране сокращено; полный текст — в журнале]"
+                : message;
+        messages.add(new ChatItem(who, display));
         while (messages.size() > RECENT_CHAT_LIMIT) messages.remove(0);
         if (tab == 0 && chatFeed != null) {
-            appendBubble(who, message);
+            appendBubble(who, display);
             while (chatFeed.getChildCount() > RECENT_CHAT_LIMIT) chatFeed.removeViewAt(0);
             if (chatScroll != null) chatScroll.post(() -> chatScroll.fullScroll(View.FOCUS_DOWN));
         }
