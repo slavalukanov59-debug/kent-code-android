@@ -305,7 +305,7 @@ public final class MainActivity extends Activity {
             catch (IOException e) { android.util.Log.w("KENT", "Журнал недоступен", e); }
         }
         String display = message.length() > 9000
-                ? message.substring(0, 9000) + "\\n[На экране сокращено; полный текст — в журнале]"
+                ? message.substring(0, 9000) + "\n[На экране сокращено; полный текст — в журнале]"
                 : message;
         messages.add(new ChatItem(who, display));
         while (messages.size() > RECENT_CHAT_LIMIT) messages.remove(0);
