@@ -37,6 +37,8 @@ jobs:
             tests/ShellRunnerSmokeTest.java
           java -cp /tmp/kent-tests ai.kent.code.WorkspaceSmokeTest
           java -cp /tmp/kent-tests ai.kent.code.ShellRunnerSmokeTest
+      - name: Test local bridge
+        run: python3 tests/test_kent_bridge.py
       # ubuntu-latest has the Android SDK command-line tools preinstalled.
       # setup-android@v3 fails currently because it requests the removed 'tools' package.
       - name: Prepare Android SDK 35
