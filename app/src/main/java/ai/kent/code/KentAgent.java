@@ -20,7 +20,8 @@ public final class KentAgent {
         boolean cancelled();
     }
 
-    private static final String API = "https://ai-flex.online/v1/chat/completions";
+    private static final String AI_FLEX_API = "https://ai-flex.online/v1/chat/completions";
+    private static final String OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
     private static final String PROMPT =
             "Ты KENT CODE — ИИ-агент для разработки Android. Пиши на русском. " +
             "Тебе доступны инструменты работы с файлами в изолированной рабочей папке приложения. " +
@@ -30,7 +31,7 @@ public final class KentAgent {
             "Дополнительно доступны run_termux и run_adb через Termux и Shizuku; это работает только при включенном BRIDGE и отдельном одобрении КАЖДОЙ команды. " +
             "run_termux запускает bash в Termux, Python/Git зависят от установленных пакетов. run_adb выполняет команду через rish с UID shell (НЕ root). " +
             "Перед выполнением показывай пользователю полный смысл команды; не предлагай секреты/ключи/учётные данные, разрушительные или скрытые действия. " +
-            "Вывод обеих команд может попасть на сервер AI-FLEX в следующем запросе; не считывай приватные данные. " +
+            "Вывод команд может попасть на сервер выбранного ИИ-провайдера в следующем запросе; не считывай приватные данные. " +
             "Никогда не утверждай, что действие выполнено, пока инструмент не подтвердил. " +
             "Не пытайся прочитать API-ключи или секретные файлы. " +
             "Не трогай чужие проекты и не выполняй операции с GitHub самостоятельно.";
@@ -154,12 +155,20 @@ public final class KentAgent {
     }
 
     private JSONObject request() throws Exception {
-        String apiKey = secrets.load();
-        if (apiKey.trim().isEmpty()) throw new IOException("Сначала сохрани новый ключ AI-FLEX в настройках");
+        String provider = secrets.provider();
+        String apiKey = secrets.loadActiveKey();
+        if (apiKey.trim().isEmpty())
+            throw new IOException("Сначала сохрани API-ключ " +
+                    (provider.equals("openrouter") ? "OpenRouter" : "AI-FLEX") + " в настройках CTRL");
         JSONObject payload = new JSONObject().put("model", secrets.model()).put("messages", history)
                 .put("tools", tools()).put("tool_choice", "auto")
-                .put("max_tokens", 1800);
-        HttpURLConnection connection = (HttpURLConnection) new URL(API).openConnection();
+                .put("max_tokens", secrets.responseTokens());
+        if (provider.equals("openrouter")) {
+            // Avoid routing to endpoints that silently drop required tool calls.
+            payload.put("provider", new JSONObject().put("require_parameters", true));
+        }
+        String endpoint = provider.equals("openrouter") ? OPENROUTER_API : AI_FLEX_API;
+        HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
         connection.setRequestMethod("POST");
         connection.setConnectTimeout(20_000);
         connection.setReadTimeout(95_000);
@@ -167,7 +176,12 @@ public final class KentAgent {
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
         connection.setRequestProperty("Accept", "application/json");
         connection.setRequestProperty("Authorization", "Bearer " + apiKey);
-        connection.setRequestProperty("User-Agent", "KENT-CODE-Android/0.1");
+        connection.setRequestProperty("User-Agent", "KENT-CODE-Android/0.4");
+        if (provider.equals("openrouter")) {
+            connection.setRequestProperty("HTTP-Referer",
+                    "https://github.com/slavalukanov59-debug/kent-code-android");
+            connection.setRequestProperty("X-Title", "KENT CODE Android");
+        }
         try {
             byte[] bytes = payload.toString().getBytes(StandardCharsets.UTF_8);
             try (OutputStream out = connection.getOutputStream()) { out.write(bytes); }
