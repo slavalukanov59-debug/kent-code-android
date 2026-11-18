@@ -62,6 +62,9 @@ public final class SecureKeyStore {
 
     public String model() { return prefs.getString("model", "deepseek-v4.1-flash-1017"); }
     public void model(String m) { prefs.edit().putString("model", m.trim()).apply(); }
-    public int steps() { return Math.max(1, Math.min(100, prefs.getInt("steps", 12))); }
-    public void steps(int count) { prefs.edit().putInt("steps", Math.max(1, Math.min(100, count))).apply(); }
+    public int steps() { return Math.max(1, Math.min(500, prefs.getInt("steps", 40))); }
+    public void steps(int count) { prefs.edit().putInt("steps", Math.max(1, Math.min(500, count))).apply(); }
+
+    public boolean trustedMode() { return prefs.getBoolean("trusted_mode", false); }
+    public void trustedMode(boolean enabled) { prefs.edit().putBoolean("trusted_mode", enabled).apply(); }
 }
