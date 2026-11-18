@@ -34,7 +34,9 @@ public final class KentAgent {
             "Вывод команд может попасть на сервер выбранного ИИ-провайдера в следующем запросе; не считывай приватные данные. " +
             "Никогда не утверждай, что действие выполнено, пока инструмент не подтвердил. " +
             "Не пытайся прочитать API-ключи или секретные файлы. " +
-            "Не трогай чужие проекты и не выполняй операции с GitHub самостоятельно.";
+            "Не трогай чужие проекты и не выполняй операции с GitHub самостоятельно. " +
+            "В долгих задачах поддерживай в рабочем проекте файл PROGRESS.md с текущим этапом, изменёнными файлами, результатами тестов и следующим действием. " +
+            "После обрезки API-контекста перечитывай PROGRESS.md и состояние Git, никогда не выдумывай результаты прошлых шагов.";
 
     private final SafeWorkspace files;
     private final ShellRunner runner;
@@ -42,6 +44,11 @@ public final class KentAgent {
     private final LocalTermuxBridge localBridge;
     private final SecureKeyStore secrets;
     private final JSONArray history = new JSONArray();
+    // A bounded API context prevents quadratic billed-token growth.
+    private static final int MAX_CONTEXT_CHARS = 32_000;
+    private static final int MAX_TOOL_RESULT_CHARS = 5_000;
+    private int lastRequestTokenEstimate = 0;
+
     private final Events events;
 
     public KentAgent(SafeWorkspace files, SecureKeyStore secrets, TermuxBridge bridge, LocalTermuxBridge localBridge, Events events) {
@@ -105,29 +112,107 @@ public final class KentAgent {
     }
 
     /** Task is synchronous for background executor. */
+    /**
+     * Keep the current user request plus whole recent assistant/tool-call groups.
+     * Never orphan a tool reply by dropping its matching assistant tool_calls.
+     */
+    private void compactHistory() {
+        if (history.length() < 8 && history.toString().length() <= MAX_CONTEXT_CHARS) return;
+        int lastUser = -1;
+        for (int i = history.length() - 1; i >= 1; i--) {
+            if ("user".equals(history.optJSONObject(i).optString("role"))) {
+                lastUser = i;
+                break;
+            }
+        }
+        if (lastUser == -1) return;
+        JSONObject system = history.optJSONObject(0);
+        JSONObject user = history.optJSONObject(lastUser);
+        // Prior task conversations are not required for executing the current task.
+        java.util.ArrayList<JSONArray> groups = new java.util.ArrayList<>();
+        for (int i = lastUser + 1; i < history.length();) {
+            JSONObject item = history.optJSONObject(i);
+            if (item == null || !"assistant".equals(item.optString("role"))) {
+                i++;
+                continue;
+            }
+            JSONArray block = new JSONArray().put(item);
+            i++;
+            while (i < history.length()) {
+                JSONObject tool = history.optJSONObject(i);
+                if (tool == null || !"tool".equals(tool.optString("role"))) break;
+                block.put(tool);
+                i++;
+            }
+            groups.add(block);
+        }
+        int room = MAX_CONTEXT_CHARS - system.toString().length() - user.toString().length();
+        // Always retain at least the most recent complete group.
+        java.util.ArrayList<JSONArray> selected = new java.util.ArrayList<>();
+        for (int i = groups.size() - 1; i >= 0; i--) {
+            JSONArray group = groups.get(i);
+            int size = group.toString().length();
+            if (!selected.isEmpty() && size > room) break;
+            selected.add(0, group);
+            room -= size;
+            if (selected.size() >= 20) break;
+        }
+        // Skip reconstructing the array when nothing would be removed.
+        int retained = 2;
+        for (JSONArray group : selected) retained += group.length();
+        if (retained == history.length() && lastUser == 1) return;
+        JSONArray replacement = new JSONArray().put(system).put(user);
+        for (JSONArray group : selected) {
+            for (int i = 0; i < group.length(); i++) replacement.put(group.optJSONObject(i));
+        }
+        while (history.length() > 0) history.remove(history.length() - 1);
+        for (int i = 0; i < replacement.length(); i++) history.put(replacement.optJSONObject(i));
+    }
+
     public void task(String instruction) {
         if (instruction == null || instruction.trim().isEmpty()) return;
         history.put(message("user", instruction));
         int toolActions = 0;
+        long billedTokensOrEstimate = 0;
+        int budget = secrets.taskTokenBudget();
         for (int n = 0; n < secrets.steps(); n++) {
             if (events.cancelled()) {
-                events.log("Остановка", "Задача отменена. Уже подтверждённые изменения сохраняются.");
+                events.log("Остановка", "Задача отменена. Изменённые файлы и журнал сохраняются.");
+                return;
+            }
+            if (billedTokensOrEstimate >= budget) {
+                events.log("Лимит токенов", "Остановлено для защиты баланса: примерно " +
+                        billedTokensOrEstimate + " / " + budget +
+                        " токенов за задачу. Проверь Git и PROGRESS.md; продолжай отдельным запросом.");
                 return;
             }
             try {
+                compactHistory();
                 JSONObject response = request();
+                JSONObject usage = response.optJSONObject("usage");
+                long reported = usage == null ? 0 : usage.optLong("total_tokens", 0);
+                billedTokensOrEstimate += Math.max(reported, lastRequestTokenEstimate);
                 JSONArray choices = response.optJSONArray("choices");
                 if (choices == null || choices.length() == 0) throw new IOException("API вернул пустой choices");
-                JSONObject message = choices.getJSONObject(0).getJSONObject("message");
-                history.put(new JSONObject(message.toString()));
-                String answer = message.optString("content", "");
-                if (!answer.trim().isEmpty() && !answer.equals("null")) events.log("КЕНТ", answer);
-                JSONArray calls = message.optJSONArray("tool_calls");
+                JSONObject answerMessage = choices.getJSONObject(0).getJSONObject("message");
+                JSONObject contextMessage = new JSONObject(answerMessage.toString());
+                String answer = answerMessage.optString("content", "");
+                if (!answer.trim().isEmpty() && !answer.equals("null")) {
+                    events.log("КЕНТ", answer);
+                    if (answer.length() > MAX_TOOL_RESULT_CHARS)
+                        contextMessage.put("content", answer.substring(0, MAX_TOOL_RESULT_CHARS) + "\n[ответ сокращён для API-контекста]");
+                }
+                history.put(contextMessage);
+                JSONArray calls = answerMessage.optJSONArray("tool_calls");
                 if (calls == null || calls.length() == 0) {
                     if (answer.trim().isEmpty()) events.log("КЕНТ", "Пустой ответ модели. Попробуй другую модель.");
+                    events.log("Расход", "Токены задачи: примерно " + billedTokensOrEstimate +
+                            " / лимит " + budget +
+                            ". Точное списание смотри в AI-FLEX.");
                     return;
                 }
                 for (int i = 0; i < calls.length(); i++) {
+                    if (events.cancelled()) return;
                     JSONObject call = calls.getJSONObject(i);
                     String id = call.optString("id", "call_" + n + "_" + i);
                     JSONObject function = call.getJSONObject("function");
@@ -135,23 +220,25 @@ public final class KentAgent {
                     JSONObject args = new JSONObject(function.optString("arguments", "{}"));
                     String result = execute(name, args);
                     toolActions++;
-                    events.log("Инструмент · " + name, result.length() > 2300 ? result.substring(0, 2300) + "\n…" : result);
+                    events.log("Инструмент · " + name,
+                            result.length() > 2300 ? result.substring(0, 2300) + "\n…" : result);
+                    String contextResult = result.length() > MAX_TOOL_RESULT_CHARS ?
+                            result.substring(0, MAX_TOOL_RESULT_CHARS) + "\n[вывод обрезан для экономии токенов]" : result;
                     history.put(new JSONObject().put("role", "tool").put("tool_call_id", id)
-                            .put("content", result));
+                            .put("content", contextResult));
                 }
             } catch (Exception e) {
                 String safe = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
                 events.log("Ошибка API", safe.substring(0, Math.min(1100, safe.length())));
+                events.log("Расход", "Примерно " + billedTokensOrEstimate +
+                        " токенов в этой задаче. Рабочие файлы не очищались.");
                 return;
             }
-            if (history.length() > 54) {
-                // Preserve system message but avoid splitting tool-call chains.
-                // Start a fresh conversation on next task instead of corrupting protocol.
-                events.log("Контекст", "История стала длинной. Очисти контекст перед следующей большой задачей.");
-            }
         }
-        events.log("Лимит шагов", "Достигнут установленный предел API-обращений для задачи (" +
-                secrets.steps() + "). Это защита от непредвиденных расходов. Можно увеличить в настройках.");
+        events.log("Лимит шагов", "Достигнут предел " + secrets.steps() +
+                " обращений. Токены задачи: примерно " + billedTokensOrEstimate +
+                " / " + budget +
+                ". Для продолжения проверь Git и PROGRESS.md, запусти новую короткую задачу.");
     }
 
     private JSONObject request() throws Exception {
@@ -184,6 +271,7 @@ public final class KentAgent {
         }
         try {
             byte[] bytes = payload.toString().getBytes(StandardCharsets.UTF_8);
+            lastRequestTokenEstimate = Math.max(1, bytes.length / 3);
             try (OutputStream out = connection.getOutputStream()) { out.write(bytes); }
             int code = connection.getResponseCode();
             InputStream stream = code < 400 ? connection.getInputStream() : connection.getErrorStream();
@@ -197,6 +285,7 @@ public final class KentAgent {
                 }
             }
             String body = new String(buffer.toByteArray(), StandardCharsets.UTF_8);
+            lastRequestTokenEstimate += Math.max(1, buffer.size() / 3);
             if (stream != null) stream.close();
             if (code != 200) {
                 String detail = body;
