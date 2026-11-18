@@ -1,4 +1,4 @@
-# KENT CODE 0.3.2 — RED PIXEL · Termux × Shizuku
+# KENT CODE 0.4.0 — RED PIXEL · Termux × Shizuku · OpenRouter
 
 ## Исправлено в 0.3.2: экран подтверждения команд
 
@@ -6,6 +6,55 @@
 - Учитываются системные отступы и вырезы Android 15–17 (targetSdk 35): заголовок не должен перекрываться статус-баром, кнопки — жестовой панелью.
 - Окно закрывается безопасным отказом при таймауте 5 минут, прерывании или отмене. Разрешение подтверждается только нажатием **РАЗРЕШИТЬ**, на одно действие.
 - Следует проверить вручную на Vivo X200: очень длинные команды (4000–5000 символов), свайп до конца, кнопки внизу, отказ, разрешение, блокировка/возвращение и статусбар.
+
+## Новое в 0.4.0: прямой OpenRouter
+
+На вкладке **CTRL → ИИ-провайдер** выбери **OpenRouter** вместо AI-FLEX. Сохранённые ключи AI-FLEX не отправляются в OpenRouter: ключи шифруются и хранятся **раздельно** в Android Keystore. В модели укажи точный OpenRouter ID, например:
+
+- `anthropic/claude-sonnet-5.5` — качественный повседневный код, поддерживает tool calling.
+- `anthropic/claude-opus-5.5` — сложные многошаговые задачи; обычно дороже.
+- `openai/gpt-6-luna` — ещё один поддерживаемый вариант.
+
+API: `https://openrouter.ai/api/v1/chat/completions`. Получи **OpenRouter API-ключ** в собственном аккаунте и вставь *только в поле ключа в приложении*, не в чат, README, GitHub или скриншоты. Запросы оплачиваются отдельно от подписки ChatGPT. Установи разумный лимит расходов у провайдера. В настройках можно увеличить число токенов ответа до 8192, но платные лимиты / ограничения Android это не отменяет. KENT по-прежнему требует одобрения каждой команды.
+
+Действующий AI-FLEX можно выбрать обратно. При смене провайдера чат-контекст сбрасывается; файлы сохраняются.
+
+## Переезд с Google Play Termux на F-Droid
+
+**ВНИМАНИЕ: Termux из Google Play (у пользователя `googleplay.2026.10.09`) несовместим по подписи с F-Droid / GitHub.** Установка поверх не работает. Сначала сделай и проверь резервную копию, только после этого удаляй Google Play Termux. Обновить полноценный Termux без миграции данных нельзя.
+
+Чтобы сохранить рабочий проект (не весь набор токенов), открой старый Termux и выполни:
+
+```bash
+termux-setup-storage
+cd ~
+git -C KENT-CODE-Android status --short
+tar -czf ~/storage/downloads/KENT-CODE-Android-safe-backup.tar.gz \
+  --exclude='.git' --exclude='.env' --exclude='*.pem' --exclude='*.key' \
+  -C "$HOME" KENT-CODE-Android
+tar -tzf ~/storage/downloads/KENT-CODE-Android-safe-backup.tar.gz | head -30
+ls -lh ~/storage/downloads/KENT-CODE-Android-safe-backup.tar.gz
+```
+
+Если есть другие личные проекты, архивируй их **отдельно**. Этот архив не является полной резервной копией всех данных Termux. Проверь, что там нет секретов. Сделай дополнительную копию на ПК/USB, а не полагайся на единственный архив. Не восстанавливай старый `$PREFIX/usr` из Google Play сборки в новую F-Droid.
+
+После проверки архива вручную удали старый Termux и его плагины, поставь Termux **с официального F-Droid**: https://f-droid.org/packages/com.termux/ . Устанавливай все плагины Termux только из того же источника. Из нового Termux:
+
+```bash
+termux-setup-storage
+pkg update && pkg upgrade -y
+pkg install git python nodejs openssh curl -y
+cd ~
+tar -xzf ~/storage/downloads/KENT-CODE-Android-safe-backup.tar.gz
+cd ~/KENT-CODE-Android
+git init
+git remote add origin https://github.com/slavalukanov59-debug/kent-code-android.git
+# При необходимости: настрой gh auth login для доступа к приватному репозиторию.
+```
+
+Файлы `rish` и `rish_shizuku.dex` можно повторно экспортировать из Shizuku; после копирования в домашнюю папку использовать `chmod 700 ~/rish` и `chmod 400 ~/rish_shizuku.dex`. Старую авторизацию Shizuku после смены приложения может потребоваться подтвердить снова.
+
+После миграции включи `allow-external-apps=true` в `~/.termux/termux.properties` и выдай KENT CODE RED разрешение `Run commands in Termux environment` — **если** новое приложение Termux его регистрирует. Ранее настроенный локальный bridge на 127.0.0.1 также остаётся допустимой альтернативой.
 
 Нативный Android-агент KENT CODE. Отдельный проект: **LUMI VISION не затрагивается**.
 
