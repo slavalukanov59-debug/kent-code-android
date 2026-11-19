@@ -32,6 +32,7 @@ public final class MissionStore {
     private String selectedId = "";
     // Execution is distinct from which historical record the user is viewing.
     private String activeId = "";
+    private boolean loadFailed = false;
 
     public static final class Mission {
         public String id, goal, provider, model, status, stage, summary, next, lastTool;
@@ -139,11 +140,13 @@ public final class MissionStore {
             // Fresh install.
         } catch (Exception e) {
             // Never overwrite a journal that failed to parse.
+            loadFailed = true;
             Log.e(TAG, "Cannot read local missions; preserving original file", e);
         }
     }
 
     private synchronized void persist() {
+        if (loadFailed) throw new IllegalStateException("Файл миссий повреждён: копируй/восстанови, не перезаписывай");
         JSONObject root = new JSONObject();
         JSONArray list = new JSONArray();
         for (Mission mission : missions) list.put(mission.toJson());
@@ -199,13 +202,15 @@ public final class MissionStore {
         return mission.copy();
     }
 
-    public synchronized Mission resume(String id) {
+    public synchronized Mission resume(String id, String provider, String model) {
         select(id);
         Mission m = null;
         for (Mission candidate : missions) if (candidate.id.equals(id)) m = candidate;
         if (m == null) throw new IllegalArgumentException("Задача не найдена");
         if ("выполняется".equals(m.status)) throw new IllegalStateException("Задача уже выполняется");
         activeId = id;
+        m.provider = provider;
+        m.model = model;
         m.attempts++;
         m.lastSessionTokens = 0;
         m.lastSessionCalls = 0;
