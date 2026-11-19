@@ -37,6 +37,7 @@ import java.io.InputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -64,6 +65,9 @@ public final class MainActivity extends Activity {
     private LocalTermuxBridge localBridge;
     private ChatJournal journal;
     private TokenMeter tokenMeter;
+    private MissionStore missionStore;
+    private String pendingMissionExportId = "";
+    private static final int REQ_MISSION_EXPORT = 743;
     private TextView usageTitle;
     private TextView usageNumbers;
     private TextView usageBreakdown;
@@ -97,6 +101,8 @@ public final class MainActivity extends Activity {
             journal = new ChatJournal(this);
             tokenMeter = new TokenMeter(this);
             tokenMeter.recoverInterrupted();
+            missionStore = new MissionStore(this);
+            missionStore.recoverInterrupted();
             bridge = new TermuxBridge(this);
             localBridge = new LocalTermuxBridge(secrets);
             if (workspace.filePaths().isEmpty()) workspace.write("hello.py", "def greet(name):\n    return f'Привет, {name}!'\n\nprint(greet('КЕНТ'))\n");
@@ -109,14 +115,14 @@ public final class MainActivity extends Activity {
             messages.add(new ChatItem(record.title, record.text));
         }
         if (messages.isEmpty()) {
-            addMessage("КЕНТ", "KENT CODE 0.4.2. Журнал сообщений теперь сохраняется на устройстве. " +
+            addMessage("КЕНТ", "KENT CODE 0.5.0. Журнал и MISSION CONTROL сохраняются на устройстве. " +
                     "BRIDGE и модель выбираются в настройках.");
         } else {
             addMessage("СЕССИЯ", "История чата восстановлена из локального журнала. " +
                     "После перезапуска модель НЕ помнит прежние обращения: чтобы продолжить работу, " +
                     "попроси её проверить git status / PROGRESS.md. Файлы проекта не очищались.");
         }
-        agent = new KentAgent(workspace, secrets, bridge, localBridge, tokenMeter, new KentAgent.Events() {
+        agent = new KentAgent(workspace, secrets, bridge, localBridge, tokenMeter, missionStore, new KentAgent.Events() {
             @Override public void log(String title, String text) { runOnUiThread(() -> addMessage(title, text)); }
             @Override public boolean approve(String title, String detail) {
                 if (stopRequested.get()) return false;
@@ -133,6 +139,11 @@ public final class MainActivity extends Activity {
             @Override public boolean cancelled() { return stopRequested.get(); }
             @Override public void usage(TokenMeter.Snapshot snapshot) {
                 runOnUiThread(() -> refreshTokenMeter(snapshot));
+            }
+            @Override public void missionChanged() {
+                runOnUiThread(() -> {
+                    if (tab == 4 && !isFinishing() && !isDestroyed()) draw();
+                });
             }
         });
         draw();
@@ -214,7 +225,7 @@ public final class MainActivity extends Activity {
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.4.4", 20, WHITE, true));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.5.0", 20, WHITE, true));
         padded(head, text("◇ AGENT ONLINE   ◇   " + (secrets.provider().equals("openrouter") ? "OPENROUTER" : "AI-FLEX") + "   ◇   ANDROID", 11, MUTED, false), 3);
         if (secrets.autopilotEnabled()) padded(head,
                 text("⚡ AUTOPILOT · БЕЗ ПОДТВЕРЖДЕНИЙ · ЖМИ СТОП ДЛЯ ОТМЕНЫ", 11, GOLD, true), 7);
@@ -223,10 +234,14 @@ public final class MainActivity extends Activity {
         LinearLayout nav = new LinearLayout(this);
         nav.setPadding(dp(10), dp(8), dp(10), dp(8));
         nav.setBackgroundColor(Color.rgb(41, 10, 19));
-        String[] labels = {"⌘ CHAT", "▣ FILES", "▧ BRIDGE", "⚙ CTRL"};
+        String[] labels = {"⌘ CHAT", "▣ FILES", "▧ BRIDGE", "⚙ CTRL", "▤ JOBS"};
         for (int i = 0; i < labels.length; i++) {
             final int selected = i;
             Button b = button(labels[i], i == tab);
+            b.setTextSize(11);
+            b.setMinimumWidth(0);
+            b.setMinWidth(0);
+            b.setPadding(dp(3), dp(5), dp(3), dp(5));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(48), 1);
             lp.setMargins(dp(3), 0, dp(3), 0);
             nav.addView(b, lp);
@@ -241,6 +256,7 @@ public final class MainActivity extends Activity {
         if (tab == 1) drawFiles();
         if (tab == 2) drawBridge();
         if (tab == 3) drawSettings();
+        if (tab == 4) drawMissions();
     }
 
     private void drawChat() {
@@ -424,8 +440,20 @@ public final class MainActivity extends Activity {
                 toast("Сначала настрой API-ключ"); tab = 3; draw(); return;
             }
         } catch (Exception e) { toast("Ошибка ключа: сбрось его в настройках"); return; }
+        try {
+            missionStore.begin(prompt, secrets.provider(), secrets.model());
+        } catch (Exception e) {
+            toast("Не удалось создать контрольную точку: " + e.getMessage());
+            return;
+        }
         composer.setText("");
-        addMessage("ТЫ", prompt);
+        launchMission(prompt, false);
+    }
+
+    private void launchMission(String prompt, boolean resumed) {
+        if (running) return;
+        if (resumed) agent.clear(); // Process memory isn't a reliable resume source.
+        addMessage(resumed ? "ТЫ · ПРОДОЛЖЕНИЕ" : "ТЫ", prompt);
         running = true;
         stopRequested.set(false);
         if (runStatus != null) runStatus.setText("🟡 Агент работает…");
@@ -434,8 +462,11 @@ public final class MainActivity extends Activity {
             try { agent.task(prompt); }
             finally {
                 running = false;
-                runOnUiThread(() -> { if (tab == 0 && runStatus != null) runStatus.setText("🟢 Готов к задачам");
-                    refreshTokenMeter(tokenMeter.snapshot()); });
+                runOnUiThread(() -> {
+                    if (tab == 0 && runStatus != null) runStatus.setText("🟢 Готов к задачам");
+                    refreshTokenMeter(tokenMeter.snapshot());
+                    if (tab == 4 && !isFinishing() && !isDestroyed()) draw();
+                });
             }
         });
     }
@@ -628,6 +659,11 @@ public final class MainActivity extends Activity {
                 saveJournalTo(data.getData());
             return;
         }
+        if (requestCode == REQ_MISSION_EXPORT) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null)
+                saveMissionReport(data.getData());
+            return;
+        }
         if (requestCode != 100 || resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         String name = "import.txt";
@@ -795,6 +831,178 @@ public final class MainActivity extends Activity {
                     "Не разрешено. Проверь дополнительные разрешения KENT CODE RED в настройках Android.");
             if (tab == 2) draw();
         }
+    }
+
+    private void drawMissions() {
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout content = vertical();
+        content.setPadding(dp(16), dp(17), dp(16), dp(27));
+        scroll.addView(content);
+        mainArea.addView(scroll);
+
+        padded(content, text("▤ MISSION CONTROL // 0.5", 20, WHITE, true), 3);
+        padded(content, text("Контроль задач, сохранение этапов и продолжение после сбоя. " +
+                "Показанный прогресс — отметки ИИ, а не доказательство успешных тестов.", 12, MUTED, false), 8);
+        MissionStore.Mission mission = missionStore.selected();
+        if (mission == null) {
+            padded(content, text("ЗАДАЧ ПОКА НЕТ", 17, GOLD, true), 23);
+            padded(content, text("Отправь задачу во вкладке CHAT. Она автоматически попадёт " +
+                    "сюда, а её состояние сохранится на устройстве.", 13, WHITE, false), 8);
+        } else {
+            LinearLayout card = vertical();
+            card.setPadding(dp(13), dp(12), dp(13), dp(14));
+            card.setBackground(shape(PANEL, 4));
+            padded(card, text("● МИССИЯ " + mission.shortId() + " · " + mission.status,
+                    14, GOLD, true), 0);
+            String goalPreview = mission.goal.length() > 600
+                    ? mission.goal.substring(0, 600) + "\n… полный текст в экспорте"
+                    : mission.goal;
+            padded(card, text(goalPreview, 13, WHITE, true), 10);
+            padded(card, text("ЭТАП: " + mission.stage, 13, BLUE, true), 13);
+            String progress = mission.total > 0
+                    ? mission.completed + "/" + mission.total + " этапов по отметкам ИИ"
+                    : "Этапы ещё не определены";
+            padded(card, text(progress, 12, MUTED, false), 6);
+            ProgressBar bar = new ProgressBar(this, null,
+                    android.R.attr.progressBarStyleHorizontal);
+            bar.setMax(1000);
+            bar.setProgressTintList(android.content.res.ColorStateList.valueOf(BLUE));
+            bar.setProgress(mission.total > 0 ? mission.completed * 1000 / mission.total : 0);
+            padded(card, bar, 7);
+            padded(card, text("ПОСЛЕДНЯЯ КОНТРОЛЬНАЯ ТОЧКА", 12, GOLD, true), 14);
+            String summaryPreview = mission.summary.length() > 700
+                    ? mission.summary.substring(0, 700) + "\n… полный текст в отчёте"
+                    : mission.summary;
+            padded(card, text(summaryPreview.isEmpty() ?
+                    "ИИ ещё не сохранял контрольную точку." : summaryPreview,
+                    12, WHITE, false), 6);
+            padded(card, text("ДАЛЬШЕ:", 12, GOLD, true), 13);
+            padded(card, text(mission.next.length() > 460 ?
+                    mission.next.substring(0, 460) + "…" : mission.next,
+                    12, WHITE, false), 5);
+            padded(card, text("Модель: " + mission.model + "\n" +
+                    "API: " + mission.calls + " · Инструменты: " + mission.tools +
+                    " · Сессии: " + mission.attempts + "\n" +
+                    "Токены за всю миссию: ≈" + tokens(mission.tokens) + "\n" +
+                    "Последний инструмент: " + mission.lastTool + "\n" +
+                    "Обновлено: " + java.text.DateFormat.getDateTimeInstance().format(
+                            new Date(mission.updated)), 12, MUTED, false), 15);
+            padded(content, card, 16);
+
+            Button resume = button("▶ ПРОДОЛЖИТЬ МИССИЮ", true);
+            padded(content, resume, 12);
+            resume.setEnabled(!running && !"выполняется".equals(mission.status));
+            resume.setOnClickListener(v -> confirmResume(mission));
+            Button stop = button("■ ОСТАНОВИТЬ АКТИВНУЮ ЗАДАЧУ", false);
+            padded(content, stop, 9);
+            stop.setEnabled(running);
+            stop.setOnClickListener(v -> {
+                stopRequested.set(true);
+                toast("Запрошена остановка; уже запущенная команда может продолжиться");
+            });
+            Button report = button("⇩ ЭКСПОРТ ОТЧЁТА МИССИИ", false);
+            padded(content, report, 9);
+            padded(content, text("Экспорт может содержать текст приватного задания — " +
+                    "сохраняй отчёт только в доверенном месте.", 11, MUTED, false), 4);
+            report.setOnClickListener(v -> {
+                pendingMissionExportId = mission.id;
+                Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("text/plain");
+                i.putExtra(Intent.EXTRA_TITLE, "KENT-mission-" + mission.shortId() + ".txt");
+                startActivityForResult(i, REQ_MISSION_EXPORT);
+            });
+        }
+
+        Button chat = button("⌘ ПЕРЕЙТИ В ЧАТ", false);
+        padded(content, chat, 13);
+        chat.setOnClickListener(v -> { tab = 0; draw(); });
+
+        padded(content, text("ИСТОРИЯ МИССИЙ (максимум 25)", 14, WHITE, true), 25);
+        for (MissionStore.Mission item : missionStore.list()) {
+            String heading = (mission != null && mission.id.equals(item.id) ? "◆ " : "◇ ") +
+                    item.shortId() + " · " + item.status + " · " +
+                    (item.goal.length() > 54 ? item.goal.substring(0, 54) + "…" : item.goal);
+            Button choose = button(heading, mission != null && mission.id.equals(item.id));
+            choose.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+            padded(content, choose, 9);
+            choose.setOnClickListener(v -> {
+                missionStore.select(item.id);
+                draw();
+            });
+        }
+        padded(content, text("После вылета задача не запускается сама. " +
+                "Нажми «Продолжить»: Кент перечитает фактическое состояние файлов и Git. " +
+                "Системные процессы Termux могут продолжаться отдельно.", 12, MUTED, false), 16);
+    }
+
+    private void confirmResume(MissionStore.Mission chosen) {
+        if (running) { toast("Сначала останови выполняющуюся задачу"); return; }
+        new AlertDialog.Builder(this)
+                .setTitle("Продолжить миссию " + chosen.shortId() + "?")
+                .setMessage("Модельный контекст предыдущего запуска утрачен. " +
+                        "Кент должен сверить реальное состояние файлов и Git перед изменениями. " +
+                        "Это новый платный запрос к " + secrets.provider() + " с отдельным лимитом токенов. " +
+                        (secrets.autopilotEnabled() ?
+                                "⚠ AUTOPILOT ВКЛЮЧЁН: следующие команды могут исполняться без дополнительных подтверждений. " : "") +
+                        "Не запускай, если предыдущие процессы Termux ещё работают.")
+                .setNegativeButton("Отмена", null)
+                .setPositiveButton("ПРОДОЛЖИТЬ", (d, w) -> {
+                    if (running) return;
+                    try {
+                        if (secrets.loadActiveKey().isBlank()) {
+                            toast("Сначала сохрани ключ в CTRL"); return;
+                        }
+                        MissionStore.Mission active = missionStore.resume(chosen.id, secrets.provider(), secrets.model());
+                        String prompt = "ПРОДОЛЖЕНИЕ МИССИИ " + active.shortId() + ". " +
+                                "Исходная задача:\n" + active.goal + "\n\n" +
+                                "Последний подтверждённый ИИ этап: " + active.stage +
+                                " (" + active.completed + "/" + active.total + ").\n" +
+                                "Контрольная точка:\n" + active.summary +
+                                "\nСледующее действие:\n" + active.next + "\n\n" +
+                                "Предыдущий модельный контекст потерян. СНАЧАЛА проверь фактические файлы, " +
+                                "Git status, существующие тесты и PROGRESS.md через доступные инструменты. " +
+                                "НЕ повторяй команды установки, удаления, отправки данных или Git push " +
+                                "без проверки состояния и отдельного согласования. " +
+                                "После проверки обнови mission_checkpoint. " +
+                                "Продолжай только с минимально необходимого следующего шага.";
+                        launchMission(prompt, true);
+                        tab = 0; draw();
+                    } catch (Exception e) {
+                        toast("Не удалось продолжить: " + e.getMessage());
+                    }
+                }).show();
+    }
+
+    private void saveMissionReport(Uri target) {
+        MissionStore.Mission selected = null;
+        for (MissionStore.Mission m : missionStore.list()) {
+            if (m.id.equals(pendingMissionExportId)) { selected = m; break; }
+        }
+        if (selected == null) { toast("Миссия не найдена"); return; }
+        final MissionStore.Mission mission = selected;
+        executor.submit(() -> {
+            String report = "KENT MISSION REPORT\nID: " + mission.id +
+                    "\nSTATUS: " + mission.status +
+                    "\nPROVIDER/MODEL: " + mission.provider + " / " + mission.model +
+                    "\nGOAL:\n" + mission.goal +
+                    "\nSTAGE: " + mission.stage + " (" + mission.completed +
+                    "/" + mission.total + ")\nSUMMARY (AI-reported):\n" + mission.summary +
+                    "\nNEXT:\n" + mission.next +
+                    "\nAPI REQUESTS: " + mission.calls +
+                    "\nTOOLS: " + mission.tools +
+                    "\nSESSIONS: " + mission.attempts +
+                    "\nAPPROX TOKENS ACROSS SESSIONS: " + mission.tokens +
+                    "\nLAST TOOL: " + mission.lastTool +
+                    "\n\nWARNING: this is an AI-reported checkpoint, not proof of tests passing.\n";
+            try (java.io.OutputStream out = getContentResolver().openOutputStream(target, "w")) {
+                if (out == null) throw new IOException("Ошибка открытия документа");
+                out.write(report.getBytes(StandardCharsets.UTF_8));
+                runOnUiThread(() -> toast("Отчёт миссии сохранён"));
+            } catch (Exception e) {
+                runOnUiThread(() -> toast("Не удалось экспортировать миссию: " + e.getMessage()));
+            }
+        });
     }
 
     private void drawSettings() {
@@ -996,7 +1204,7 @@ public final class MainActivity extends Activity {
                 "Shizuku/ADB. Подтверждения инструментов отключены ТОЛЬКО если включён AUTOPILOT. " +
                 "Результаты команд отправляются выбранному ИИ-провайдеру, поэтому не читай секреты. " +
                 "Запросы к платным API могут списывать деньги.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.4.4 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("KENT CODE · Android 0.5.0 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }

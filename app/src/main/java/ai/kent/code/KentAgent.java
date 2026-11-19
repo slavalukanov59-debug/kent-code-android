@@ -19,6 +19,7 @@ public final class KentAgent {
         boolean approve(String title, String detail);
         boolean cancelled();
         void usage(TokenMeter.Snapshot snapshot);
+        void missionChanged();
     }
 
     private static final String AI_FLEX_API = "https://ai-flex.online/v1/chat/completions";
@@ -37,7 +38,10 @@ public final class KentAgent {
             "Не пытайся прочитать API-ключи или секретные файлы. " +
             "Не трогай чужие проекты и не выполняй операции с GitHub самостоятельно. " +
             "В долгих задачах поддерживай в рабочем проекте файл PROGRESS.md с текущим этапом, изменёнными файлами, результатами тестов и следующим действием. " +
-            "После обрезки API-контекста перечитывай PROGRESS.md и состояние Git, никогда не выдумывай результаты прошлых шагов.";
+            "После обрезки API-контекста перечитывай PROGRESS.md и состояние Git, никогда не выдумывай результаты прошлых шагов. " +
+            "Mission Control: в начале длительной задачи вызови mission_checkpoint со стадией, коротким планом, следующим действием, completed=0 и total (число этапов). " +
+            "После каждого проверенного этапа обновляй mission_checkpoint с фактами тестов и следующим действием. " +
+            "Не отмечай этап завершённым до проверки результатов. При ограничении токенов сохрани прогресс локально и прекрати работу.";
 
     private final SafeWorkspace files;
     private final ShellRunner runner;
@@ -52,16 +56,18 @@ public final class KentAgent {
     private int lastInputEstimate = 0;
     private int lastOutputEstimate = 0;
     private final TokenMeter tokenMeter;
+    private final MissionStore missionStore;
 
     private final Events events;
 
-    public KentAgent(SafeWorkspace files, SecureKeyStore secrets, TermuxBridge bridge, LocalTermuxBridge localBridge, TokenMeter tokenMeter, Events events) {
+    public KentAgent(SafeWorkspace files, SecureKeyStore secrets, TermuxBridge bridge, LocalTermuxBridge localBridge, TokenMeter tokenMeter, MissionStore missionStore, Events events) {
         this.files = files;
         this.runner = new ShellRunner(files.root());
         this.bridge = bridge;
         this.localBridge = localBridge;
         this.secrets = secrets;
         this.tokenMeter = tokenMeter;
+        this.missionStore = missionStore;
         this.events = events;
         history.put(message("system", PROMPT));
     }
@@ -94,6 +100,13 @@ public final class KentAgent {
 
     private static JSONArray tools() {
         try { return new JSONArray()
+                .put(action("mission_checkpoint", "Save a durable Mission Control checkpoint: stage, verified facts, next action, completed and total stages. Update after every tested milestone.", new JSONObject()
+                        .put("stage", property("string"))
+                        .put("summary", property("string"))
+                        .put("next", property("string"))
+                        .put("completed", property("integer"))
+                        .put("total", property("integer")),
+                        "stage", "summary", "next", "completed", "total"))
                 .put(action("list_files", "List project files and folders", new JSONObject()))
                 .put(action("read_file", "Read an existing UTF-8 file in app workspace", new JSONObject()
                         .put("path", property("string")), "path"))
@@ -183,13 +196,16 @@ public final class KentAgent {
         tokenMeter.begin(secrets.provider(), budget);
         events.usage(tokenMeter.snapshot());
         boolean failed = false;
+        String missionStatus = "пауза: лимит API-шагов";
         try {
         for (int n = 0; n < secrets.steps(); n++) {
             if (events.cancelled()) {
+                missionStatus = "остановлена";
                 events.log("Остановка", "Задача отменена. Изменённые файлы и журнал сохраняются.");
                 return;
             }
             if (billedTokensOrEstimate >= budget) {
+                missionStatus = "пауза: лимит токенов";
                 events.log("Лимит токенов", "Остановлено для защиты баланса: примерно " +
                         billedTokensOrEstimate + " / " + budget +
                         " токенов за задачу. Проверь Git и PROGRESS.md; продолжай отдельным запросом.");
@@ -210,7 +226,9 @@ public final class KentAgent {
                 long counted = hasExactUsage ? reported : lastRequestTokenEstimate;
                 TokenMeter.Snapshot updated = tokenMeter.record(counted, input, output, !hasExactUsage);
                 billedTokensOrEstimate = updated.used;
+                missionStore.noteUsage(updated);
                 events.usage(updated);
+                events.missionChanged();
                 JSONArray choices = response.optJSONArray("choices");
                 if (choices == null || choices.length() == 0) throw new IOException("API вернул пустой choices");
                 JSONObject answerMessage = choices.getJSONObject(0).getJSONObject("message");
@@ -224,6 +242,7 @@ public final class KentAgent {
                 history.put(contextMessage);
                 JSONArray calls = answerMessage.optJSONArray("tool_calls");
                 if (calls == null || calls.length() == 0) {
+                    missionStatus = "ответ получен";
                     if (answer.trim().isEmpty()) events.log("КЕНТ", "Пустой ответ модели. Попробуй другую модель.");
                     events.log("Расход", "Токены задачи: примерно " + billedTokensOrEstimate +
                             " / лимит " + budget +
@@ -231,7 +250,7 @@ public final class KentAgent {
                     return;
                 }
                 for (int i = 0; i < calls.length(); i++) {
-                    if (events.cancelled()) return;
+                    if (events.cancelled()) { missionStatus = "остановлена"; return; }
                     JSONObject call = calls.getJSONObject(i);
                     String id = call.optString("id", "call_" + n + "_" + i);
                     JSONObject function = call.getJSONObject("function");
@@ -239,6 +258,8 @@ public final class KentAgent {
                     JSONObject args = new JSONObject(function.optString("arguments", "{}"));
                     String result = execute(name, args);
                     toolActions++;
+                    if (!"mission_checkpoint".equals(name)) missionStore.noteTool(name);
+                    events.missionChanged();
                     events.log("Инструмент · " + name,
                             result.length() > 2300 ? result.substring(0, 2300) + "\n…" : result);
                     String contextResult = result.length() > MAX_TOOL_RESULT_CHARS ?
@@ -248,6 +269,7 @@ public final class KentAgent {
                 }
             } catch (Exception e) {
                 failed = true;
+                missionStatus = "ошибка";
                 String safe = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
                 events.log("Ошибка API", safe.substring(0, Math.min(1100, safe.length())));
                 events.log("Расход", "Примерно " + billedTokensOrEstimate +
@@ -260,9 +282,12 @@ public final class KentAgent {
                 " / " + budget +
                 ". Для продолжения проверь Git и PROGRESS.md, запусти новую короткую задачу.");
         } finally {
+            if (events.cancelled()) missionStatus = "остановлена";
+            missionStore.finish(missionStatus);
             tokenMeter.finish(events.cancelled() ? "остановлена" :
                     failed ? "ошибка" : "завершена");
             events.usage(tokenMeter.snapshot());
+            events.missionChanged();
         }
     }
 
@@ -334,6 +359,11 @@ public final class KentAgent {
         try {
             String path = args.optString("path", "");
             switch (name) {
+                case "mission_checkpoint": {
+                    String result = missionStore.checkpoint(args);
+                    events.missionChanged();
+                    return result;
+                }
                 case "list_files": return files.tree();
                 case "read_file": return files.read(path);
                 case "search_text": return files.search(args.getString("query"));
