@@ -444,7 +444,6 @@ public final class MainActivity extends Activity {
         String shortText = message.length() > previewLimit
                 ? message.substring(0, previewLimit) + "\n…" : message;
         TextView body = text(shortText, 13, WHITE, false);
-        body.setTextIsSelectable(true);
         padded(card, body, 3);
         if (message.length() > previewLimit) {
             Button expand = button("▸ ПОКАЗАТЬ ПОЛНОСТЬЮ", false);
