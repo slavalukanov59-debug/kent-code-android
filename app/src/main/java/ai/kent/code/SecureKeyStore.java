@@ -23,6 +23,25 @@ public final class SecureKeyStore {
         prefs = context.getSharedPreferences("kent_settings", Context.MODE_PRIVATE);
     }
 
+
+    /**
+     * API credentials are a single HTTP header token. Reject pasted tasks,
+     * whitespace, Unicode and control characters BEFORE they reach network logs.
+     * Do not require a specific vendor prefix: AI-FLEX and OpenRouter may differ.
+     */
+    public static void validateApiKey(String value) {
+        if (value == null || value.trim().isEmpty())
+            throw new IllegalArgumentException("Нет API-ключа: открой CTRL и введи ключ AI-FLEX / OpenRouter");
+        if (value.length() > 2048)
+            throw new IllegalArgumentException("Это не похоже на API-ключ. В CTRL вставь только ключ, а задачу отправь в CHAT");
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (ch <= 32 || ch >= 127)
+                throw new IllegalArgumentException("API-ключ содержит пробелы, переносы строк или текст задачи. " +
+                        "В CTRL вставь только ключ, задания отправляй в CHAT");
+        }
+    }
+
     private SecretKey key() throws Exception {
         KeyStore store = KeyStore.getInstance("AndroidKeyStore");
         store.load(null);
@@ -41,6 +60,7 @@ public final class SecureKeyStore {
             prefs.edit().remove("api_key").apply();
             return;
         }
+        validateApiKey(secret.trim());
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key());
         byte[] encrypted = cipher.doFinal(secret.trim().getBytes(StandardCharsets.UTF_8));
@@ -104,6 +124,7 @@ public final class SecureKeyStore {
             prefs.edit().remove("openrouter_key").apply();
             return;
         }
+        validateApiKey(value.trim());
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key());
         byte[] encrypted = cipher.doFinal(value.trim().getBytes(StandardCharsets.UTF_8));
