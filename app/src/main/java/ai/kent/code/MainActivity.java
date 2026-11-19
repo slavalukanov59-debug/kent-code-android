@@ -225,7 +225,7 @@ public final class MainActivity extends Activity {
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.5.0", 20, WHITE, true));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.5.1", 20, WHITE, true));
         padded(head, text("◇ AGENT ONLINE   ◇   " + (secrets.provider().equals("openrouter") ? "OPENROUTER" : "AI-FLEX") + "   ◇   ANDROID", 11, MUTED, false), 3);
         if (secrets.autopilotEnabled()) padded(head,
                 text("⚡ AUTOPILOT · БЕЗ ПОДТВЕРЖДЕНИЙ · ЖМИ СТОП ДЛЯ ОТМЕНЫ", 11, GOLD, true), 7);
@@ -436,10 +436,11 @@ public final class MainActivity extends Activity {
         String prompt = composer.getText().toString().trim();
         if (prompt.isEmpty()) return;
         try {
-            if (secrets.loadActiveKey().trim().isEmpty()) {
-                toast("Сначала настрой API-ключ"); tab = 3; draw(); return;
-            }
-        } catch (Exception e) { toast("Ошибка ключа: сбрось его в настройках"); return; }
+            SecureKeyStore.validateApiKey(secrets.loadActiveKey());
+        } catch (Exception e) {
+            toast("Неверный API-ключ: вставь только ключ в CTRL, задачу — в CHAT");
+            tab = 3; draw(); return;
+        }
         try {
             missionStore.begin(prompt, secrets.provider(), secrets.model());
         } catch (Exception e) {
@@ -1026,9 +1027,13 @@ public final class MainActivity extends Activity {
                 "AI-FLEX сохранён для обратной совместимости.", 12, MUTED, false), 8);
 
         padded(content, text("🔑 API-ключ ВЫБРАННОГО провайдера (пусто = оставить)", 13, MUTED, true), 18);
-        EditText key = field("Вставь ключ только здесь", "");
+        EditText key = field("Только API-ключ, НЕ текст задачи", "");
+        key.setSingleLine(true);
         key.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         padded(content, key, 6);
+        padded(content, text("СЮДА — только секретный ключ AI-FLEX/OpenRouter. " +
+                "Большие задания отправляй через CHAT. " +
+                "Неверный ключ нельзя сохранить — не будет ошибок Bearer/HTTP.", 12, GOLD, false), 6);
         padded(content, text("API-ключи хранятся раздельно и зашифрованно (Android Keystore). " +
                 "Никогда не вставляй ключ в чат и не публикуй его в GitHub.", 12, MUTED, false), 6);
 
@@ -1204,7 +1209,7 @@ public final class MainActivity extends Activity {
                 "Shizuku/ADB. Подтверждения инструментов отключены ТОЛЬКО если включён AUTOPILOT. " +
                 "Результаты команд отправляются выбранному ИИ-провайдеру, поэтому не читай секреты. " +
                 "Запросы к платным API могут списывать деньги.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.5.0 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("KENT CODE · Android 0.5.1 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }

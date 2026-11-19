@@ -271,6 +271,11 @@ public final class KentAgent {
                 failed = true;
                 missionStatus = "ошибка";
                 String safe = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                // Never echo an HTTP Authorization header or a pasted key to
+                // the chat journal (which can later be exported).
+                if (safe.contains("Bearer ") || safe.contains("Authorization") ||
+                        safe.contains("header value:"))
+                    safe = "Неверный API-ключ в CTRL. Проверь ключ выбранного провайдера и сохрани заново.";
                 events.log("Ошибка API", safe.substring(0, Math.min(1100, safe.length())));
                 events.log("Расход", "Примерно " + billedTokensOrEstimate +
                         " токенов в этой задаче. Рабочие файлы не очищались.");
@@ -294,9 +299,9 @@ public final class KentAgent {
     private JSONObject request() throws Exception {
         String provider = secrets.provider();
         String apiKey = secrets.loadActiveKey();
-        if (apiKey.trim().isEmpty())
-            throw new IOException("Сначала сохрани API-ключ " +
-                    (provider.equals("openrouter") ? "OpenRouter" : "AI-FLEX") + " в настройках CTRL");
+        // Old installations may already contain a pasted multiline prompt in
+        // encrypted settings. Do not let it reach Authorization or error logs.
+        SecureKeyStore.validateApiKey(apiKey);
         JSONObject payload = new JSONObject().put("model", secrets.model()).put("messages", history)
                 .put("tools", tools()).put("tool_choice", "auto")
                 .put("max_tokens", secrets.responseTokens());

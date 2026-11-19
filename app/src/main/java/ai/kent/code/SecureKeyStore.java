@@ -23,6 +23,12 @@ public final class SecureKeyStore {
         prefs = context.getSharedPreferences("kent_settings", Context.MODE_PRIVATE);
     }
 
+
+    /** Checks an opaque key without logging it, before HTTP Authorization. */
+    public static void validateApiKey(String value) {
+        ApiKeyValidator.check(value);
+    }
+
     private SecretKey key() throws Exception {
         KeyStore store = KeyStore.getInstance("AndroidKeyStore");
         store.load(null);
@@ -41,6 +47,7 @@ public final class SecureKeyStore {
             prefs.edit().remove("api_key").apply();
             return;
         }
+        validateApiKey(secret.trim());
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key());
         byte[] encrypted = cipher.doFinal(secret.trim().getBytes(StandardCharsets.UTF_8));
@@ -104,6 +111,7 @@ public final class SecureKeyStore {
             prefs.edit().remove("openrouter_key").apply();
             return;
         }
+        validateApiKey(value.trim());
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key());
         byte[] encrypted = cipher.doFinal(value.trim().getBytes(StandardCharsets.UTF_8));
