@@ -264,6 +264,13 @@ public final class KentAgent {
                 failed = true;
                 missionStatus = "ошибка";
                 String safe = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                if (e instanceof java.net.SocketTimeoutException)
+                    safe = "Таймаут ответа провайдера. Запрос мог выполниться и списать средства; " +
+                            "автоповтор отключён. Проверь баланс и состояние проекта перед продолжением.";
+                else if (e instanceof TemporaryProviderException)
+                    safe = "Провайдер вернул HTTP " +
+                            ((TemporaryProviderException) e).status +
+                            " после повторной попытки. Проверь статус провайдера и продолжи миссию позже.";
                 // Never echo an HTTP Authorization header or a pasted key to
                 // the chat journal (which can later be exported).
                 if (safe.contains("Bearer ") || safe.contains("Authorization") ||
@@ -285,7 +292,39 @@ public final class KentAgent {
         }
     }
 
+    private static final class TemporaryProviderException extends IOException {
+        final int status;
+        TemporaryProviderException(int status, String message) {
+            super(message);
+            this.status = status;
+        }
+    }
+
+    /**
+     * Retry only explicit transient HTTP errors, at most once. Never retry
+     * socket timeouts automatically: the first POST may have been billed.
+     * No tool command is executed during retry.
+     */
     private JSONObject request() throws Exception {
+        for (int attempt = 1; attempt <= ApiRetryPolicy.MAX_ATTEMPTS; attempt++) {
+            if (events.cancelled()) throw new InterruptedException("Задача отменена");
+            try {
+                return requestOnce();
+            } catch (TemporaryProviderException e) {
+                if (attempt >= ApiRetryPolicy.MAX_ATTEMPTS) throw e;
+                events.log("Сервер ИИ", "Временная ошибка HTTP " + e.status +
+                        ". Повторяю запрос один раз; инструменты не запускаются повторно.");
+                long delay = ApiRetryPolicy.waitMillis(attempt);
+                for (long slept = 0; slept < delay; slept += 250) {
+                    if (events.cancelled()) throw new InterruptedException("Задача отменена");
+                    Thread.sleep(Math.min(250, delay - slept));
+                }
+            }
+        }
+        throw new IOException("Не удалось получить ответ ИИ");
+    }
+
+    private JSONObject requestOnce() throws Exception {
         String provider = secrets.provider();
         String apiKey = secrets.loadActiveKey();
         // Old installations may already contain a pasted multiline prompt in
@@ -303,7 +342,7 @@ public final class KentAgent {
         HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
         connection.setRequestMethod("POST");
         connection.setConnectTimeout(20_000);
-        connection.setReadTimeout(95_000);
+        connection.setReadTimeout(120_000);
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
         connection.setRequestProperty("Accept", "application/json");
@@ -341,7 +380,12 @@ public final class KentAgent {
                     JSONObject err = new JSONObject(body).optJSONObject("error");
                     if (err != null) detail = err.optString("message", body);
                 } catch (Exception ignored) {}
-                throw new IOException("HTTP " + code + ": " + detail.substring(0, Math.min(detail.length(), 600)));
+                String description = "HTTP " + code + ": " +
+                        detail.substring(0, Math.min(detail.length(), 600));
+                if (ApiRetryPolicy.isTransient(code)) {
+                    throw new TemporaryProviderException(code, description);
+                }
+                throw new IOException(description);
             }
             return new JSONObject(body);
         } finally {
