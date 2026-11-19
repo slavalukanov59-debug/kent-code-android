@@ -238,7 +238,7 @@ public final class MainActivity extends Activity {
         head.setGravity(Gravity.CENTER_VERTICAL);
         head.setPadding(dp(12), dp(7), dp(12), dp(7));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        TextView title = text("■ KENT 0.5.2", 16, WHITE, true);
+        TextView title = text("■ KENT 0.5.3", 16, WHITE, true);
         head.addView(title, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1));
         TextView providerTag = text((secrets.provider().equals("openrouter") ?
@@ -979,7 +979,7 @@ public final class MainActivity extends Activity {
                 .setTitle("Продолжить миссию " + chosen.shortId() + "?")
                 .setMessage("Модельный контекст предыдущего запуска утрачен. " +
                         "Кент должен сверить реальное состояние файлов и Git перед изменениями. " +
-                        "Это новый платный запрос к " + secrets.provider() + " с отдельным лимитом токенов. " +
+                        "Это новый платный запрос к " + secrets.provider() + ". Лимита токенов внутри KENT нет. " +
                         (secrets.autopilotEnabled() ?
                                 "⚠ AUTOPILOT ВКЛЮЧЁН: следующие команды могут исполняться без дополнительных подтверждений. " : "") +
                         "Не запускай, если предыдущие процессы Termux ещё работают.")
@@ -991,8 +991,13 @@ public final class MainActivity extends Activity {
                             toast("Сначала сохрани ключ в CTRL"); return;
                         }
                         MissionStore.Mission active = missionStore.resume(chosen.id, secrets.provider(), secrets.model());
+                        String original = active.goal.length() > 3600
+                                ? active.goal.substring(0, 3600) +
+                                  "\n[Длинная исходная инструкция сокращена для API. " +
+                                  "Приоритет — проверенные файлы, Git и PROGRESS.md.]"
+                                : active.goal;
                         String prompt = "ПРОДОЛЖЕНИЕ МИССИИ " + active.shortId() + ". " +
-                                "Исходная задача:\n" + active.goal + "\n\n" +
+                                "Исходная задача:\n" + original + "\n\n" +
                                 "Последний подтверждённый ИИ этап: " + active.stage +
                                 " (" + active.completed + "/" + active.total + ").\n" +
                                 "Контрольная точка:\n" + active.summary +
@@ -1211,7 +1216,7 @@ public final class MainActivity extends Activity {
                         } catch (IOException e) { toast("Ошибка журнала"); }
                     }).show();
         });
-        padded(extra, text("KENT 0.5.2 · RED PIXEL · Termux + Shizuku", 11, MUTED, false), 13);
+        padded(extra, text("KENT 0.5.3 · RED PIXEL · Termux + Shizuku", 11, MUTED, false), 13);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
