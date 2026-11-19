@@ -18,6 +18,7 @@ public final class KentAgent {
         void log(String title, String message);
         boolean approve(String title, String detail);
         boolean cancelled();
+        void usage(TokenMeter.Snapshot snapshot);
     }
 
     private static final String AI_FLEX_API = "https://ai-flex.online/v1/chat/completions";
@@ -48,15 +49,19 @@ public final class KentAgent {
     private static final int MAX_CONTEXT_CHARS = 32_000;
     private static final int MAX_TOOL_RESULT_CHARS = 5_000;
     private int lastRequestTokenEstimate = 0;
+    private int lastInputEstimate = 0;
+    private int lastOutputEstimate = 0;
+    private final TokenMeter tokenMeter;
 
     private final Events events;
 
-    public KentAgent(SafeWorkspace files, SecureKeyStore secrets, TermuxBridge bridge, LocalTermuxBridge localBridge, Events events) {
+    public KentAgent(SafeWorkspace files, SecureKeyStore secrets, TermuxBridge bridge, LocalTermuxBridge localBridge, TokenMeter tokenMeter, Events events) {
         this.files = files;
         this.runner = new ShellRunner(files.root());
         this.bridge = bridge;
         this.localBridge = localBridge;
         this.secrets = secrets;
+        this.tokenMeter = tokenMeter;
         this.events = events;
         history.put(message("system", PROMPT));
     }
@@ -175,6 +180,10 @@ public final class KentAgent {
         int toolActions = 0;
         long billedTokensOrEstimate = 0;
         int budget = secrets.taskTokenBudget();
+        tokenMeter.begin(secrets.provider(), budget);
+        events.usage(tokenMeter.snapshot());
+        boolean failed = false;
+        try {
         for (int n = 0; n < secrets.steps(); n++) {
             if (events.cancelled()) {
                 events.log("Остановка", "Задача отменена. Изменённые файлы и журнал сохраняются.");
@@ -191,7 +200,17 @@ public final class KentAgent {
                 JSONObject response = request();
                 JSONObject usage = response.optJSONObject("usage");
                 long reported = usage == null ? 0 : usage.optLong("total_tokens", 0);
-                billedTokensOrEstimate += Math.max(reported, lastRequestTokenEstimate);
+                boolean hasExactUsage = reported > 0;
+                long input = usage == null ? -1 : usage.optLong("prompt_tokens",
+                        usage.optLong("input_tokens", -1));
+                long output = usage == null ? -1 : usage.optLong("completion_tokens",
+                        usage.optLong("output_tokens", -1));
+                if (input < 0) input = lastInputEstimate;
+                if (output < 0) output = lastOutputEstimate;
+                long counted = hasExactUsage ? reported : lastRequestTokenEstimate;
+                TokenMeter.Snapshot updated = tokenMeter.record(counted, input, output, !hasExactUsage);
+                billedTokensOrEstimate = updated.used;
+                events.usage(updated);
                 JSONArray choices = response.optJSONArray("choices");
                 if (choices == null || choices.length() == 0) throw new IOException("API вернул пустой choices");
                 JSONObject answerMessage = choices.getJSONObject(0).getJSONObject("message");
@@ -228,6 +247,7 @@ public final class KentAgent {
                             .put("content", contextResult));
                 }
             } catch (Exception e) {
+                failed = true;
                 String safe = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
                 events.log("Ошибка API", safe.substring(0, Math.min(1100, safe.length())));
                 events.log("Расход", "Примерно " + billedTokensOrEstimate +
@@ -239,6 +259,11 @@ public final class KentAgent {
                 " обращений. Токены задачи: примерно " + billedTokensOrEstimate +
                 " / " + budget +
                 ". Для продолжения проверь Git и PROGRESS.md, запусти новую короткую задачу.");
+        } finally {
+            tokenMeter.finish(events.cancelled() ? "остановлена" :
+                    failed ? "ошибка" : "завершена");
+            events.usage(tokenMeter.snapshot());
+        }
     }
 
     private JSONObject request() throws Exception {
@@ -271,7 +296,9 @@ public final class KentAgent {
         }
         try {
             byte[] bytes = payload.toString().getBytes(StandardCharsets.UTF_8);
-            lastRequestTokenEstimate = Math.max(1, bytes.length / 3);
+            lastInputEstimate = Math.max(1, bytes.length / 3);
+            lastOutputEstimate = 0;
+            lastRequestTokenEstimate = lastInputEstimate;
             try (OutputStream out = connection.getOutputStream()) { out.write(bytes); }
             int code = connection.getResponseCode();
             InputStream stream = code < 400 ? connection.getInputStream() : connection.getErrorStream();
@@ -285,7 +312,8 @@ public final class KentAgent {
                 }
             }
             String body = new String(buffer.toByteArray(), StandardCharsets.UTF_8);
-            lastRequestTokenEstimate += Math.max(1, buffer.size() / 3);
+            lastOutputEstimate = Math.max(1, buffer.size() / 3);
+            lastRequestTokenEstimate += lastOutputEstimate;
             if (stream != null) stream.close();
             if (code != 200) {
                 String detail = body;
