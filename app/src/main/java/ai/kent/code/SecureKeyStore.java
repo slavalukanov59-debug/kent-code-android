@@ -24,22 +24,9 @@ public final class SecureKeyStore {
     }
 
 
-    /**
-     * API credentials are a single HTTP header token. Reject pasted tasks,
-     * whitespace, Unicode and control characters BEFORE they reach network logs.
-     * Do not require a specific vendor prefix: AI-FLEX and OpenRouter may differ.
-     */
+    /** Checks an opaque key without logging it, before HTTP Authorization. */
     public static void validateApiKey(String value) {
-        if (value == null || value.trim().isEmpty())
-            throw new IllegalArgumentException("Нет API-ключа: открой CTRL и введи ключ AI-FLEX / OpenRouter");
-        if (value.length() > 2048)
-            throw new IllegalArgumentException("Это не похоже на API-ключ. В CTRL вставь только ключ, а задачу отправь в CHAT");
-        for (int i = 0; i < value.length(); i++) {
-            char ch = value.charAt(i);
-            if (ch <= 32 || ch >= 127)
-                throw new IllegalArgumentException("API-ключ содержит пробелы, переносы строк или текст задачи. " +
-                        "В CTRL вставь только ключ, задания отправляй в CHAT");
-        }
+        ApiKeyValidator.check(value);
     }
 
     private SecretKey key() throws Exception {
