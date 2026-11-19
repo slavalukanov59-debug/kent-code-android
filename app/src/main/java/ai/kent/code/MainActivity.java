@@ -172,7 +172,7 @@ public final class MainActivity extends Activity {
         t.setText(s);
         t.setTextSize(sp);
         t.setTextColor(color);
-        t.setLineSpacing(dp(3), 1.05f);
+        t.setLineSpacing(dp(1), 1.02f);
         t.setTypeface(Typeface.MONOSPACE, bold ? Typeface.BOLD : Typeface.NORMAL);
         return t;
     }
@@ -181,11 +181,11 @@ public final class MainActivity extends Activity {
         Button b = new Button(this);
         b.setText(s);
         b.setAllCaps(false);
-        b.setTextSize(13);
+        b.setTextSize(12);
         b.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         b.setTextColor(WHITE);
         b.setBackground(shape(primary ? Color.rgb(184, 29, 58) : PANEL_2, 3));
-        b.setPadding(dp(10), dp(6), dp(10), dp(6));
+        b.setPadding(dp(8), dp(4), dp(8), dp(4));
         return b;
     }
 
@@ -196,9 +196,9 @@ public final class MainActivity extends Activity {
         f.setHintTextColor(MUTED);
         f.setSingleLine(false);
         f.setTextColor(WHITE);
-        f.setTextSize(14);
+        f.setTextSize(13);
         f.setTypeface(Typeface.MONOSPACE);
-        f.setPadding(dp(12), dp(12), dp(12), dp(12));
+        f.setPadding(dp(9), dp(8), dp(9), dp(8));
         f.setBackground(shape(PANEL, 10));
         return f;
     }
@@ -847,13 +847,12 @@ public final class MainActivity extends Activity {
     private void drawMissions() {
         ScrollView scroll = new ScrollView(this);
         LinearLayout content = vertical();
-        content.setPadding(dp(16), dp(17), dp(16), dp(27));
+        content.setPadding(dp(12), dp(10), dp(12), dp(15));
         scroll.addView(content);
         mainArea.addView(scroll);
 
-        padded(content, text("▤ MISSION CONTROL // 0.5", 20, WHITE, true), 3);
-        padded(content, text("Контроль задач, сохранение этапов и продолжение после сбоя. " +
-                "Показанный прогресс — отметки ИИ, а не доказательство успешных тестов.", 12, MUTED, false), 8);
+        padded(content, text("▤ МИССИИ", 17, WHITE, true), 2);
+        padded(content, text("Этапы отмечает ИИ; проверяй результаты в Git.", 11, MUTED, false), 4);
         MissionStore.Mission mission = missionStore.selected();
         if (mission == null) {
             padded(content, text("ЗАДАЧ ПОКА НЕТ", 17, GOLD, true), 23);
@@ -861,60 +860,69 @@ public final class MainActivity extends Activity {
                     "сюда, а её состояние сохранится на устройстве.", 13, WHITE, false), 8);
         } else {
             LinearLayout card = vertical();
-            card.setPadding(dp(13), dp(12), dp(13), dp(14));
+            card.setPadding(dp(10), dp(9), dp(10), dp(9));
             card.setBackground(shape(PANEL, 4));
             padded(card, text("● МИССИЯ " + mission.shortId() + " · " + mission.status,
                     14, GOLD, true), 0);
-            String goalPreview = mission.goal.length() > 600
-                    ? mission.goal.substring(0, 600) + "\n… полный текст в экспорте"
-                    : mission.goal;
-            padded(card, text(goalPreview, 13, WHITE, true), 10);
-            padded(card, text("ЭТАП: " + mission.stage, 13, BLUE, true), 13);
+            String goalPreview = mission.goal.length() > 190
+                    ? mission.goal.substring(0, 190) + "…" : mission.goal;
+            padded(card, text(goalPreview, 12, WHITE, true), 5);
+            padded(card, text("ЭТАП: " + mission.stage, 12, BLUE, true), 8);
             String progress = mission.total > 0
                     ? mission.completed + "/" + mission.total + " этапов по отметкам ИИ"
                     : "Этапы ещё не определены";
-            padded(card, text(progress, 12, MUTED, false), 6);
+            padded(card, text(progress, 11, MUTED, false), 3);
             ProgressBar bar = new ProgressBar(this, null,
                     android.R.attr.progressBarStyleHorizontal);
             bar.setMax(1000);
             bar.setProgressTintList(android.content.res.ColorStateList.valueOf(BLUE));
             bar.setProgress(mission.total > 0 ? mission.completed * 1000 / mission.total : 0);
-            padded(card, bar, 7);
-            padded(card, text("ПОСЛЕДНЯЯ КОНТРОЛЬНАЯ ТОЧКА", 12, GOLD, true), 14);
-            String summaryPreview = mission.summary.length() > 700
-                    ? mission.summary.substring(0, 700) + "\n… полный текст в отчёте"
-                    : mission.summary;
-            padded(card, text(summaryPreview.isEmpty() ?
-                    "ИИ ещё не сохранял контрольную точку." : summaryPreview,
-                    12, WHITE, false), 6);
-            padded(card, text("ДАЛЬШЕ:", 12, GOLD, true), 13);
-            padded(card, text(mission.next.length() > 460 ?
-                    mission.next.substring(0, 460) + "…" : mission.next,
-                    12, WHITE, false), 5);
-            padded(card, text("Модель: " + mission.model + "\n" +
-                    "API: " + mission.calls + " · Инструменты: " + mission.tools +
-                    " · Сессии: " + mission.attempts + "\n" +
-                    "Токены за всю миссию: ≈" + tokens(mission.tokens) + "\n" +
-                    "Последний инструмент: " + mission.lastTool + "\n" +
-                    "Обновлено: " + java.text.DateFormat.getDateTimeInstance().format(
-                            new Date(mission.updated)), 12, MUTED, false), 15);
-            padded(content, card, 16);
+            padded(card, bar, 4);
+            TextView summaryCompact = text(mission.summary.isEmpty() ?
+                    "Контрольных точек пока нет." :
+                    (mission.summary.length() > 135 ?
+                            mission.summary.substring(0, 135) + "…" : mission.summary),
+                    11, MUTED, false);
+            padded(card, summaryCompact, 5);
+            Button more = button("▸ ПОДРОБНОСТИ", false);
+            padded(card, more, 6);
+            LinearLayout details = vertical();
+            details.setVisibility(View.GONE);
+            padded(card, details, 3);
+            more.setOnClickListener(v -> {
+                boolean open = details.getVisibility() != View.VISIBLE;
+                details.setVisibility(open ? View.VISIBLE : View.GONE);
+                more.setText(open ? "▾ СВЕРНУТЬ" : "▸ ПОДРОБНОСТИ");
+            });
+            padded(details, text("КОНТРОЛЬНАЯ ТОЧКА", 11, GOLD, true), 5);
+            padded(details, text(mission.summary.isEmpty() ?
+                    "Нет" : mission.summary, 12, WHITE, false), 3);
+            padded(details, text("СЛЕДУЮЩИЙ ШАГ", 11, GOLD, true), 9);
+            padded(details, text(mission.next, 12, WHITE, false), 3);
+            padded(details, text("Модель: " + mission.model + " · API: " + mission.calls +
+                    " · Инструменты: " + mission.tools +
+                    "\nСессии: " + mission.attempts +
+                    " · Примерно токенов: " + tokens(mission.tokens) +
+                    "\nПоследний инструмент: " + mission.lastTool, 11, MUTED, false), 8);
+            padded(content, card, 9);
 
-            Button resume = button("▶ ПРОДОЛЖИТЬ МИССИЮ", true);
-            padded(content, resume, 12);
+            LinearLayout controls = new LinearLayout(this);
+            padded(content, controls, 7);
+            Button resume = button("▶ ПРОДОЛЖИТЬ", true);
+            controls.addView(resume, new LinearLayout.LayoutParams(0, dp(40), 1));
             resume.setEnabled(!running && !"выполняется".equals(mission.status));
             resume.setOnClickListener(v -> confirmResume(mission));
-            Button stop = button("■ ОСТАНОВИТЬ АКТИВНУЮ ЗАДАЧУ", false);
-            padded(content, stop, 9);
+            Button stop = button("■ СТОП", false);
+            LinearLayout.LayoutParams stopLp = new LinearLayout.LayoutParams(0, dp(40), 1);
+            stopLp.leftMargin = dp(6);
+            controls.addView(stop, stopLp);
             stop.setEnabled(running);
             stop.setOnClickListener(v -> {
                 stopRequested.set(true);
-                toast("Запрошена остановка; уже запущенная команда может продолжиться");
+                toast("Запрошена остановка. Уже запущенный процесс может продолжаться.");
             });
-            Button report = button("⇩ ЭКСПОРТ ОТЧЁТА МИССИИ", false);
-            padded(content, report, 9);
-            padded(content, text("Экспорт может содержать текст приватного задания — " +
-                    "сохраняй отчёт только в доверенном месте.", 11, MUTED, false), 4);
+            Button report = button("⇩ ЭКСПОРТ ОТЧЁТА", false);
+            padded(details, report, 10);
             report.setOnClickListener(v -> {
                 pendingMissionExportId = mission.id;
                 Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
@@ -925,26 +933,24 @@ public final class MainActivity extends Activity {
             });
         }
 
-        Button chat = button("⌘ ПЕРЕЙТИ В ЧАТ", false);
-        padded(content, chat, 13);
+        Button chat = button("⌘ ОТКРЫТЬ ЧАТ", false);
+        padded(content, chat, 9);
         chat.setOnClickListener(v -> { tab = 0; draw(); });
 
-        padded(content, text("ИСТОРИЯ МИССИЙ (максимум 25)", 14, WHITE, true), 25);
+        padded(content, text("ИСТОРИЯ", 13, WHITE, true), 15);
         for (MissionStore.Mission item : missionStore.list()) {
             String heading = (mission != null && mission.id.equals(item.id) ? "◆ " : "◇ ") +
                     item.shortId() + " · " + item.status + " · " +
                     (item.goal.length() > 54 ? item.goal.substring(0, 54) + "…" : item.goal);
             Button choose = button(heading, mission != null && mission.id.equals(item.id));
             choose.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-            padded(content, choose, 9);
+            padded(content, choose, 5);
             choose.setOnClickListener(v -> {
                 missionStore.select(item.id);
                 draw();
             });
         }
-        padded(content, text("После вылета задача не запускается сама. " +
-                "Нажми «Продолжить»: Кент перечитает фактическое состояние файлов и Git. " +
-                "Системные процессы Termux могут продолжаться отдельно.", 12, MUTED, false), 16);
+        padded(content, text("Продолжение после сбоя — вручную. Проверь, завершились ли старые процессы.", 11, MUTED, false), 9);
     }
 
     private void confirmResume(MissionStore.Mission chosen) {
