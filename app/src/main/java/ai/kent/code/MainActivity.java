@@ -26,6 +26,7 @@ import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.ProgressBar;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -62,6 +63,11 @@ public final class MainActivity extends Activity {
     private TermuxBridge bridge;
     private LocalTermuxBridge localBridge;
     private ChatJournal journal;
+    private TokenMeter tokenMeter;
+    private TextView usageTitle;
+    private TextView usageNumbers;
+    private TextView usageBreakdown;
+    private ProgressBar usageBar;
     private static final int REQ_JOURNAL_EXPORT = 742;
     private static final int RECENT_CHAT_LIMIT = 120;
     private String lastBridgeResult = "Проверки ещё не запускались.";
@@ -89,6 +95,8 @@ public final class MainActivity extends Activity {
             workspace = new SafeWorkspace(new java.io.File(getFilesDir(), "workspace"));
             secrets = new SecureKeyStore(this);
             journal = new ChatJournal(this);
+            tokenMeter = new TokenMeter(this);
+            tokenMeter.recoverInterrupted();
             bridge = new TermuxBridge(this);
             localBridge = new LocalTermuxBridge(secrets);
             if (workspace.filePaths().isEmpty()) workspace.write("hello.py", "def greet(name):\n    return f'Привет, {name}!'\n\nprint(greet('КЕНТ'))\n");
@@ -108,7 +116,7 @@ public final class MainActivity extends Activity {
                     "После перезапуска модель НЕ помнит прежние обращения: чтобы продолжить работу, " +
                     "попроси её проверить git status / PROGRESS.md. Файлы проекта не очищались.");
         }
-        agent = new KentAgent(workspace, secrets, bridge, localBridge, new KentAgent.Events() {
+        agent = new KentAgent(workspace, secrets, bridge, localBridge, tokenMeter, new KentAgent.Events() {
             @Override public void log(String title, String text) { runOnUiThread(() -> addMessage(title, text)); }
             @Override public boolean approve(String title, String detail) {
                 if (stopRequested.get()) return false;
@@ -123,6 +131,9 @@ public final class MainActivity extends Activity {
                 return requestApproval(title, detail);
             }
             @Override public boolean cancelled() { return stopRequested.get(); }
+            @Override public void usage(TokenMeter.Snapshot snapshot) {
+                runOnUiThread(() -> refreshTokenMeter(snapshot));
+            }
         });
         draw();
     }
@@ -203,7 +214,7 @@ public final class MainActivity extends Activity {
         LinearLayout head = vertical();
         head.setPadding(dp(18), dp(13), dp(18), dp(14));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.4.3", 20, WHITE, true));
+        head.addView(text("█ KENT CODE // RED PIXEL 0.4.4", 20, WHITE, true));
         padded(head, text("◇ AGENT ONLINE   ◇   " + (secrets.provider().equals("openrouter") ? "OPENROUTER" : "AI-FLEX") + "   ◇   ANDROID", 11, MUTED, false), 3);
         if (secrets.autopilotEnabled()) padded(head,
                 text("⚡ AUTOPILOT · БЕЗ ПОДТВЕРЖДЕНИЙ · ЖМИ СТОП ДЛЯ ОТМЕНЫ", 11, GOLD, true), 7);
@@ -245,6 +256,30 @@ public final class MainActivity extends Activity {
         cancel.setOnClickListener(v -> { stopRequested.set(true); toast("Остановка после текущего API-запроса"); });
         statusRow.addView(cancel, new LinearLayout.LayoutParams(dp(98), dp(45)));
         mainArea.addView(statusRow);
+
+        // Task budget meter survives screen redraws and Android process restarts.
+        // It tracks our configurable per-task cap, never claims AI-FLEX wallet balance.
+        LinearLayout usagePanel = vertical();
+        usagePanel.setPadding(dp(14), dp(10), dp(14), dp(11));
+        usagePanel.setBackground(shape(PANEL, 3));
+        usageTitle = text("◈ ТОКЕНЫ ЗАДАЧИ", 13, GOLD, true);
+        usagePanel.addView(usageTitle);
+        usageNumbers = text("", 13, WHITE, true);
+        padded(usagePanel, usageNumbers, 5);
+        usageBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        usageBar.setMax(1000);
+        usageBar.setProgressTintList(android.content.res.ColorStateList.valueOf(BLUE));
+        usageBar.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(PANEL_2));
+        padded(usagePanel, usageBar, 6);
+        usageBreakdown = text("", 11, MUTED, false);
+        padded(usagePanel, usageBreakdown, 5);
+        padded(usagePanel, text("Остаток — лимит задачи из CTRL, НЕ деньги на счёте AI-FLEX. " +
+                "Оценка может отличаться от фактического расхода API.", 10, MUTED, false), 5);
+        LinearLayout.LayoutParams panelParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        panelParams.setMargins(dp(12), dp(3), dp(12), dp(8));
+        mainArea.addView(usagePanel, panelParams);
+        refreshTokenMeter(tokenMeter.snapshot());
 
         chatScroll = new ScrollView(this);
         chatScroll.setFillViewport(true);
@@ -297,6 +332,28 @@ public final class MainActivity extends Activity {
         sendRow.addView(send, go);
         send.setOnClickListener(v -> submit());
         mainArea.addView(sendRow);
+    }
+
+    private static String tokens(long count) {
+        return String.format(java.util.Locale.US, "%,d", count).replace(',', ' ');
+    }
+
+    private void refreshTokenMeter(TokenMeter.Snapshot snapshot) {
+        if (snapshot == null || usageTitle == null || usageNumbers == null
+                || usageBar == null || usageBreakdown == null || tab != 0) return;
+        String source = "openrouter".equals(snapshot.provider) ? "OPENROUTER" : "AI-FLEX";
+        usageTitle.setText("◈ ТОКЕНЫ ЗАДАЧИ · " + source + " · " + snapshot.status);
+        String prefix = snapshot.approximate() ? "≈" : "";
+        usageNumbers.setText("ИСПОЛЬЗОВАНО " + prefix + tokens(snapshot.used) +
+                " / " + tokens(snapshot.budget) +
+                "     ОСТАЛОСЬ " + prefix + tokens(snapshot.remaining()));
+        usageBar.setProgress(snapshot.permille());
+        usageBreakdown.setText("ВХОД: " + tokens(snapshot.input) +
+                "   ВЫХОД: " + tokens(snapshot.output) +
+                "   API: " + snapshot.calls +
+                "\nВСЕГО ЧЕРЕЗ KENT (" + source + "): " + prefix + tokens(snapshot.cumulative) +
+                (snapshot.approximate() ? "\n⚠ Часть API не вернула usage: применена оценка." : "") +
+                "\nРазбивка вход/выход может быть приблизительной.");
     }
 
     private void addMessage(String who, String message) {
@@ -372,11 +429,13 @@ public final class MainActivity extends Activity {
         running = true;
         stopRequested.set(false);
         if (runStatus != null) runStatus.setText("🟡 Агент работает…");
+        refreshTokenMeter(tokenMeter.snapshot());
         executor.submit(() -> {
             try { agent.task(prompt); }
             finally {
                 running = false;
-                runOnUiThread(() -> { if (tab == 0 && runStatus != null) runStatus.setText("🟢 Готов к задачам"); });
+                runOnUiThread(() -> { if (tab == 0 && runStatus != null) runStatus.setText("🟢 Готов к задачам");
+                    refreshTokenMeter(tokenMeter.snapshot()); });
             }
         });
     }
@@ -830,6 +889,9 @@ public final class MainActivity extends Activity {
         padded(content, text("Защита от повторной отправки длинного контекста. " +
                 "Учитывается usage из API, либо приблизительная оценка. " +
                 "Проверяй реальный расход в AI-FLEX: лимит приблизительный.", 12, MUTED, false), 5);
+        padded(content, text("В CHAT видны потраченные, оставшиеся токены и шкала текущей задачи. " +
+                "Счётчик ведётся локально и сохраняется после перезапуска. " +
+                "Остаток НЕ показывает баланс AI-FLEX или свободный контекст модели.", 12, MUTED, false), 6);
 
         padded(content, text("🔄 Максимум API-шагов (1–500)", 13, MUTED, true), 17);
         EditText steps = field("40", String.valueOf(secrets.steps()));
@@ -934,7 +996,7 @@ public final class MainActivity extends Activity {
                 "Shizuku/ADB. Подтверждения инструментов отключены ТОЛЬКО если включён AUTOPILOT. " +
                 "Результаты команд отправляются выбранному ИИ-провайдеру, поэтому не читай секреты. " +
                 "Запросы к платным API могут списывать деньги.", 13, MUTED, false), 9);
-        padded(content, text("KENT CODE · Android 0.4.3 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
+        padded(content, text("KENT CODE · Android 0.4.4 RED PIXEL · GitHub Actions", 12, MUTED, false), 20);
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
