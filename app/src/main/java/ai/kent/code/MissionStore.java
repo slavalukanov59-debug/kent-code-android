@@ -228,7 +228,7 @@ public final class MissionStore {
 
     /** AI checkpoint: descriptive progress, not verified percentage. */
     public synchronized String checkpoint(JSONObject params) {
-        Mission m = selectedMutable();
+        Mission m = activeMutable();
         if (m == null) return "Нет активной задачи";
         String stage = clip(params.optString("stage", ""), 160).trim();
         String summary = clip(params.optString("summary", ""), 2200).trim();
@@ -250,7 +250,7 @@ public final class MissionStore {
     }
 
     public synchronized void noteTool(String name) {
-        Mission m = selectedMutable();
+        Mission m = activeMutable();
         if (m == null) return;
         m.tools++;
         m.lastTool = clip(name, 100);
@@ -259,7 +259,7 @@ public final class MissionStore {
     }
 
     public synchronized void noteUsage(TokenMeter.Snapshot usage) {
-        Mission m = selectedMutable();
+        Mission m = activeMutable();
         if (m == null || usage == null) return;
         if (usage.used >= m.lastSessionTokens) {
             m.tokens += usage.used - m.lastSessionTokens;
@@ -273,7 +273,7 @@ public final class MissionStore {
     }
 
     public synchronized void finish(String status) {
-        Mission m = selectedMutable();
+        Mission m = activeMutable();
         if (m == null) return;
         m.status = clip(status, 90);
         m.updated = System.currentTimeMillis();
