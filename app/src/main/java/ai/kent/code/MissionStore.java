@@ -30,6 +30,8 @@ public final class MissionStore {
     private final AtomicFile file;
     private final ArrayList<Mission> missions = new ArrayList<>();
     private String selectedId = "";
+    // Execution is distinct from which historical record the user is viewing.
+    private String activeId = "";
 
     public static final class Mission {
         public String id, goal, provider, model, status, stage, summary, next, lastTool;
@@ -171,8 +173,8 @@ public final class MissionStore {
         return missions.isEmpty() ? null : missions.get(0).copy();
     }
 
-    private Mission selectedMutable() {
-        for (Mission m : missions) if (m.id.equals(selectedId)) return m;
+    private Mission activeMutable() {
+        for (Mission m : missions) if (m.id.equals(activeId)) return m;
         return null;
     }
 
@@ -192,13 +194,15 @@ public final class MissionStore {
         missions.add(0, mission);
         while (missions.size() > MAX_MISSIONS) missions.remove(missions.size() - 1);
         selectedId = mission.id;
+        activeId = mission.id;
         persist();
         return mission.copy();
     }
 
     public synchronized Mission resume(String id) {
         select(id);
-        Mission m = selectedMutable();
+        activeId = id;
+        Mission m = activeMutable();
         if (m == null) throw new IllegalArgumentException("Задача не найдена");
         if ("выполняется".equals(m.status)) throw new IllegalStateException("Задача уже выполняется");
         m.attempts++;
@@ -217,6 +221,7 @@ public final class MissionStore {
             m.updated = System.currentTimeMillis();
             changed = true;
         }
+        activeId = "";
         if (changed) persist();
     }
 
@@ -271,6 +276,7 @@ public final class MissionStore {
         if (m == null) return;
         m.status = clip(status, 90);
         m.updated = System.currentTimeMillis();
+        activeId = "";
         persist();
     }
 }
