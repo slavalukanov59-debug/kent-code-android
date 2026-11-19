@@ -201,10 +201,11 @@ public final class MissionStore {
 
     public synchronized Mission resume(String id) {
         select(id);
-        activeId = id;
-        Mission m = activeMutable();
+        Mission m = null;
+        for (Mission candidate : missions) if (candidate.id.equals(id)) m = candidate;
         if (m == null) throw new IllegalArgumentException("Задача не найдена");
         if ("выполняется".equals(m.status)) throw new IllegalStateException("Задача уже выполняется");
+        activeId = id;
         m.attempts++;
         m.lastSessionTokens = 0;
         m.lastSessionCalls = 0;
