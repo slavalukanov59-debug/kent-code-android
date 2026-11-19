@@ -57,6 +57,7 @@ public final class MainActivity extends Activity {
     private static final int GREEN = Color.rgb(127, 232, 162);
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService creditExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean stopRequested = new AtomicBoolean(false);
     private SafeWorkspace workspace;
     private SecureKeyStore secrets;
@@ -68,10 +69,11 @@ public final class MainActivity extends Activity {
     private MissionStore missionStore;
     private String pendingMissionExportId = "";
     private static final int REQ_MISSION_EXPORT = 743;
-    private TextView usageTitle;
-    private TextView usageNumbers;
-    private TextView usageBreakdown;
-    private ProgressBar usageBar;
+    private TextView creditLabel;
+    private String creditText = "Кредиты: —";
+    private String creditDetail = "";
+    private volatile long lastCreditAttemptMs = 0;
+    private volatile boolean creditLoading = false;
     private static final int REQ_JOURNAL_EXPORT = 742;
     private static final int RECENT_CHAT_LIMIT = 120;
     private String lastBridgeResult = "Проверки ещё не запускались.";
@@ -217,24 +219,34 @@ public final class MainActivity extends Activity {
             app.setOnApplyWindowInsetsListener((view, windowInsets) -> {
                 Insets bars = windowInsets.getInsets(
                         WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
-                view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+                // Android 15-17 edge-to-edge: shift the entire root above the
+                // soft keyboard, not only the ScrollView.
+                Insets ime = windowInsets.getInsets(WindowInsets.Type.ime());
+                int bottom = windowInsets.isVisible(WindowInsets.Type.ime())
+                        ? Math.max(bars.bottom, ime.bottom) : bars.bottom;
+                view.setPadding(bars.left, bars.top, bars.right, bottom);
                 return windowInsets;
             });
         }
         setContentView(app);
-        LinearLayout head = vertical();
-        head.setPadding(dp(18), dp(13), dp(18), dp(14));
+        LinearLayout head = new LinearLayout(this);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        head.setPadding(dp(12), dp(7), dp(12), dp(7));
         head.setBackgroundColor(Color.rgb(41, 10, 19));
-        head.addView(text("█ KENT CODE // RED PIXEL 0.5.1", 20, WHITE, true));
-        padded(head, text("◇ AGENT ONLINE   ◇   " + (secrets.provider().equals("openrouter") ? "OPENROUTER" : "AI-FLEX") + "   ◇   ANDROID", 11, MUTED, false), 3);
-        if (secrets.autopilotEnabled()) padded(head,
-                text("⚡ AUTOPILOT · БЕЗ ПОДТВЕРЖДЕНИЙ · ЖМИ СТОП ДЛЯ ОТМЕНЫ", 11, GOLD, true), 7);
+        TextView title = text("■ KENT 0.5.2", 16, WHITE, true);
+        head.addView(title, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        TextView providerTag = text((secrets.provider().equals("openrouter") ?
+                "OPENROUTER" : "AI-FLEX") +
+                (secrets.autopilotEnabled() ? "  ⚡ AUTO" : "  SAFE"), 10,
+                secrets.autopilotEnabled() ? GOLD : MUTED, true);
+        head.addView(providerTag);
         app.addView(head);
 
         LinearLayout nav = new LinearLayout(this);
-        nav.setPadding(dp(10), dp(8), dp(10), dp(8));
+        nav.setPadding(dp(5), dp(3), dp(5), dp(3));
         nav.setBackgroundColor(Color.rgb(41, 10, 19));
-        String[] labels = {"⌘ CHAT", "▣ FILES", "▧ BRIDGE", "⚙ CTRL", "▤ JOBS"};
+        String[] labels = {"ЧАТ", "ФАЙЛЫ", "МОСТ", "CTRL", "JOBS"};
         for (int i = 0; i < labels.length; i++) {
             final int selected = i;
             Button b = button(labels[i], i == tab);
@@ -242,7 +254,7 @@ public final class MainActivity extends Activity {
             b.setMinimumWidth(0);
             b.setMinWidth(0);
             b.setPadding(dp(3), dp(5), dp(3), dp(5));
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(48), 1);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(40), 1);
             lp.setMargins(dp(3), 0, dp(3), 0);
             nav.addView(b, lp);
             b.setOnClickListener(v -> { tab = selected; draw(); });
@@ -261,7 +273,7 @@ public final class MainActivity extends Activity {
 
     private void drawChat() {
         LinearLayout statusRow = new LinearLayout(this);
-        statusRow.setPadding(dp(16), dp(12), dp(16), dp(9));
+        statusRow.setPadding(dp(12), dp(5), dp(12), dp(5));
         runStatus = text(running ? "◉ [BUSY] агент работает" : (secrets.autopilotEnabled() ?
                 "⚡ [AUTOPILOT] готов" : (secrets.trustedMode() ? "◆ [TRUSTED] готов" : "◇ [SAFE] готов")), 12,
                 running ? GOLD : (secrets.autopilotEnabled() ? GOLD : (secrets.trustedMode() ? BLUE : GREEN)), true);
@@ -270,81 +282,52 @@ public final class MainActivity extends Activity {
         statusRow.addView(runStatus, statusWeight);
         Button cancel = button("■ Стоп", false);
         cancel.setOnClickListener(v -> { stopRequested.set(true); toast("Остановка после текущего API-запроса"); });
-        statusRow.addView(cancel, new LinearLayout.LayoutParams(dp(98), dp(45)));
+        statusRow.addView(cancel, new LinearLayout.LayoutParams(dp(72), dp(36)));
         mainArea.addView(statusRow);
 
-        // Task budget meter survives screen redraws and Android process restarts.
-        // It tracks our configurable per-task cap, never claims AI-FLEX wallet balance.
-        LinearLayout usagePanel = vertical();
-        usagePanel.setPadding(dp(14), dp(10), dp(14), dp(11));
-        usagePanel.setBackground(shape(PANEL, 3));
-        usageTitle = text("◈ ТОКЕНЫ ЗАДАЧИ", 13, GOLD, true);
-        usagePanel.addView(usageTitle);
-        usageNumbers = text("", 13, WHITE, true);
-        padded(usagePanel, usageNumbers, 5);
-        usageBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        usageBar.setMax(1000);
-        usageBar.setProgressTintList(android.content.res.ColorStateList.valueOf(BLUE));
-        usageBar.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(PANEL_2));
-        padded(usagePanel, usageBar, 6);
-        usageBreakdown = text("", 11, MUTED, false);
-        padded(usagePanel, usageBreakdown, 5);
-        padded(usagePanel, text("Остаток — лимит задачи из CTRL, НЕ деньги на счёте AI-FLEX. " +
-                "Оценка может отличаться от фактического расхода API.", 10, MUTED, false), 5);
-        LinearLayout.LayoutParams panelParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        panelParams.setMargins(dp(12), dp(3), dp(12), dp(8));
-        mainArea.addView(usagePanel, panelParams);
-        refreshTokenMeter(tokenMeter.snapshot());
+        LinearLayout creditBar = new LinearLayout(this);
+        creditBar.setGravity(Gravity.CENTER_VERTICAL);
+        creditBar.setPadding(dp(12), dp(4), dp(10), dp(4));
+        creditLabel = text(creditText, 12, GOLD, true);
+        creditBar.addView(creditLabel, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        Button refresh = button("↻", false);
+        refresh.setTextSize(17);
+        creditBar.addView(refresh, new LinearLayout.LayoutParams(dp(36), dp(34)));
+        refresh.setOnClickListener(v -> requestCredits(true));
+        Button site = button("↗", false);
+        site.setTextSize(16);
+        LinearLayout.LayoutParams siteLp = new LinearLayout.LayoutParams(dp(36), dp(34));
+        siteLp.leftMargin = dp(5);
+        creditBar.addView(site, siteLp);
+        site.setOnClickListener(v -> openCreditSite());
+        mainArea.addView(creditBar);
+        requestCredits(false);
 
         chatScroll = new ScrollView(this);
         chatScroll.setFillViewport(true);
         chatFeed = vertical();
-        chatFeed.setPadding(dp(14), dp(8), dp(14), dp(12));
+        chatFeed.setPadding(dp(10), dp(5), dp(10), dp(8));
         chatScroll.addView(chatFeed);
         mainArea.addView(chatScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
         redrawFeed();
 
-        LinearLayout actions = new LinearLayout(this);
-        actions.setPadding(dp(12), dp(8), dp(12), dp(8));
-        Button clear = button("Очистить диалог", false);
-        clear.setOnClickListener(v -> {
-            if (running) { toast("Сначала останови текущую задачу"); return; }
-            new AlertDialog.Builder(this)
-                    .setTitle("Удалить историю диалога?")
-                    .setMessage("Локальный журнал также будет удалён. Сначала экспортируй его, " +
-                            "если хочешь сохранить отчёты. Код проекта не изменится.")
-                    .setNegativeButton("Отмена", null)
-                    .setPositiveButton("Очистить", (d, w) -> {
-                        try {
-                            journal.clear();
-                            agent.clear();
-                            messages.clear();
-                            chatFeed.removeAllViews();
-                            addMessage("КЕНТ", "Контекст и журнал очищены. Файлы проекта не затронуты.");
-                        } catch (IOException e) { toast("Ошибка журнала: " + e.getMessage()); }
-                    }).show();
-        });
-        actions.addView(clear, new LinearLayout.LayoutParams(0, dp(48), 1));
-        Button export = button("⇩ Журнал", false);
-        LinearLayout.LayoutParams exportLp = new LinearLayout.LayoutParams(0, dp(48), 1);
-        exportLp.leftMargin = dp(8);
-        actions.addView(export, exportLp);
-        export.setOnClickListener(v -> exportJournal());
-        mainArea.addView(actions);
-
         LinearLayout sendRow = new LinearLayout(this);
-        sendRow.setPadding(dp(12), dp(6), dp(12), dp(14));
+        sendRow.setGravity(Gravity.BOTTOM);
+        sendRow.setPadding(dp(9), dp(5), dp(9), dp(7));
         composer = field("Опиши задачу КЕНТУ…", "");
-        composer.setMinLines(2);
-        composer.setMaxLines(5);
+        composer.setMinLines(1);
+        composer.setMaxLines(4);
+        composer.setGravity(Gravity.TOP | Gravity.START);
+        composer.setImeOptions(android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        composer.setPadding(dp(11), dp(9), dp(11), dp(9));
         LinearLayout.LayoutParams entry = new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1);
         sendRow.addView(composer, entry);
         Button send = button("➤", true);
-        LinearLayout.LayoutParams go = new LinearLayout.LayoutParams(dp(66), dp(72));
-        go.leftMargin = dp(8);
+        LinearLayout.LayoutParams go = new LinearLayout.LayoutParams(dp(51), dp(49));
+        go.leftMargin = dp(6);
         sendRow.addView(send, go);
         send.setOnClickListener(v -> submit());
         mainArea.addView(sendRow);
@@ -354,22 +337,37 @@ public final class MainActivity extends Activity {
         return String.format(java.util.Locale.US, "%,d", count).replace(',', ' ');
     }
 
-    private void refreshTokenMeter(TokenMeter.Snapshot snapshot) {
-        if (snapshot == null || usageTitle == null || usageNumbers == null
-                || usageBar == null || usageBreakdown == null || tab != 0) return;
-        String source = "openrouter".equals(snapshot.provider) ? "OPENROUTER" : "AI-FLEX";
-        usageTitle.setText("◈ ТОКЕНЫ ЗАДАЧИ · " + source + " · " + snapshot.status);
-        String prefix = snapshot.approximate() ? "≈" : "";
-        usageNumbers.setText("ИСПОЛЬЗОВАНО " + prefix + tokens(snapshot.used) +
-                " / " + tokens(snapshot.budget) +
-                "     ОСТАЛОСЬ " + prefix + tokens(snapshot.remaining()));
-        usageBar.setProgress(snapshot.permille());
-        usageBreakdown.setText("ВХОД: " + tokens(snapshot.input) +
-                "   ВЫХОД: " + tokens(snapshot.output) +
-                "   API: " + snapshot.calls +
-                "\nВСЕГО ЧЕРЕЗ KENT (" + source + "): " + prefix + tokens(snapshot.cumulative) +
-                (snapshot.approximate() ? "\n⚠ Часть API не вернула usage: применена оценка." : "") +
-                "\nРазбивка вход/выход может быть приблизительной.");
+    private void openCreditSite() {
+        String url = secrets.provider().equals("openrouter") ?
+                "https://openrouter.ai/activity" : "https://ai-flex.online/";
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        } catch (Exception e) { toast("Не удалось открыть сайт провайдера"); }
+    }
+
+    private void requestCredits(boolean force) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (creditLoading || (!force && now - lastCreditAttemptMs < 120_000)) return;
+        lastCreditAttemptMs = now;
+        creditLoading = true;
+        creditText = "Кредиты: проверка…";
+        if (tab == 0 && creditLabel != null) creditLabel.setText(creditText);
+        creditExecutor.submit(() -> {
+            CreditBalance.Result result;
+            try {
+                result = CreditBalance.query(secrets.provider(), secrets.loadActiveKey());
+            } catch (Exception e) {
+                result = new CreditBalance.Result("Кредиты: —", false,
+                        "Не удалось получить данные аккаунта.");
+            }
+            final CreditBalance.Result finalResult = result;
+            runOnUiThread(() -> {
+                creditLoading = false;
+                creditText = finalResult.label;
+                creditDetail = finalResult.details;
+                if (tab == 0 && creditLabel != null) creditLabel.setText(creditText);
+            });
+        });
     }
 
     private void addMessage(String who, String message) {
@@ -385,7 +383,7 @@ public final class MainActivity extends Activity {
         if (tab == 0 && chatFeed != null) {
             appendBubble(who, display);
             while (chatFeed.getChildCount() > RECENT_CHAT_LIMIT) chatFeed.removeViewAt(0);
-            if (chatScroll != null) chatScroll.post(() -> chatScroll.fullScroll(View.FOCUS_DOWN));
+            // Do not hijack the user’s reading position when the agent answers.
         }
     }
 
@@ -413,21 +411,21 @@ public final class MainActivity extends Activity {
         if (chatFeed == null) return;
         chatFeed.removeAllViews();
         for (ChatItem item : messages) appendBubble(item.title, item.text);
-        if (chatScroll != null) chatScroll.post(() -> chatScroll.fullScroll(View.FOCUS_DOWN));
+        // Keep scroll at its current reading position (no automatic jump).
     }
 
     private void appendBubble(String who, String message) {
         LinearLayout card = vertical();
-        card.setPadding(dp(13), dp(11), dp(13), dp(11));
+        card.setPadding(dp(10), dp(8), dp(10), dp(8));
         int fill = who.equals("ТЫ") ? Color.rgb(73, 18, 35) : PANEL;
-        card.setBackground(shape(fill, 13));
+        card.setBackground(shape(fill, 4));
         card.addView(text(who, 11, who.startsWith("Ошибка") ? GOLD : BLUE, true));
-        padded(card, text(message, 14, WHITE, false), 5);
+        padded(card, text(message, 13, WHITE, false), 3);
         LinearLayout.LayoutParams box = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        box.bottomMargin = dp(10);
-        box.leftMargin = who.equals("ТЫ") ? dp(26) : 0;
-        box.rightMargin = who.equals("ТЫ") ? 0 : dp(20);
+        box.bottomMargin = dp(6);
+        box.leftMargin = who.equals("ТЫ") ? dp(18) : 0;
+        box.rightMargin = who.equals("ТЫ") ? 0 : dp(10);
         chatFeed.addView(card, box);
     }
 
@@ -458,14 +456,14 @@ public final class MainActivity extends Activity {
         running = true;
         stopRequested.set(false);
         if (runStatus != null) runStatus.setText("🟡 Агент работает…");
-        refreshTokenMeter(tokenMeter.snapshot());
+        // Credit display refreshes from the provider rather than token estimates.
         executor.submit(() -> {
             try { agent.task(prompt); }
             finally {
                 running = false;
                 runOnUiThread(() -> {
                     if (tab == 0 && runStatus != null) runStatus.setText("🟢 Готов к задачам");
-                    refreshTokenMeter(tokenMeter.snapshot());
+                    requestCredits(false);
                     if (tab == 4 && !isFinishing() && !isDestroyed()) draw();
                 });
             }
@@ -1217,6 +1215,7 @@ public final class MainActivity extends Activity {
     @Override protected void onDestroy() {
         stopRequested.set(true);
         executor.shutdownNow();
+        creditExecutor.shutdownNow();
         super.onDestroy();
     }
 }
