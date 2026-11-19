@@ -854,7 +854,10 @@ public final class MainActivity extends Activity {
             card.setBackground(shape(PANEL, 4));
             padded(card, text("● МИССИЯ " + mission.shortId() + " · " + mission.status,
                     14, GOLD, true), 0);
-            padded(card, text(mission.goal, 13, WHITE, true), 10);
+            String goalPreview = mission.goal.length() > 600
+                    ? mission.goal.substring(0, 600) + "\n… полный текст в экспорте"
+                    : mission.goal;
+            padded(card, text(goalPreview, 13, WHITE, true), 10);
             padded(card, text("ЭТАП: " + mission.stage, 13, BLUE, true), 13);
             String progress = mission.total > 0
                     ? mission.completed + "/" + mission.total + " этапов по отметкам ИИ"
@@ -867,11 +870,16 @@ public final class MainActivity extends Activity {
             bar.setProgress(mission.total > 0 ? mission.completed * 1000 / mission.total : 0);
             padded(card, bar, 7);
             padded(card, text("ПОСЛЕДНЯЯ КОНТРОЛЬНАЯ ТОЧКА", 12, GOLD, true), 14);
-            padded(card, text(mission.summary.isEmpty() ?
-                    "ИИ ещё не сохранял контрольную точку." : mission.summary,
+            String summaryPreview = mission.summary.length() > 700
+                    ? mission.summary.substring(0, 700) + "\n… полный текст в отчёте"
+                    : mission.summary;
+            padded(card, text(summaryPreview.isEmpty() ?
+                    "ИИ ещё не сохранял контрольную точку." : summaryPreview,
                     12, WHITE, false), 6);
             padded(card, text("ДАЛЬШЕ:", 12, GOLD, true), 13);
-            padded(card, text(mission.next, 12, WHITE, false), 5);
+            padded(card, text(mission.next.length() > 460 ?
+                    mission.next.substring(0, 460) + "…" : mission.next,
+                    12, WHITE, false), 5);
             padded(card, text("Модель: " + mission.model + "\n" +
                     "API: " + mission.calls + " · Инструменты: " + mission.tools +
                     " · Сессии: " + mission.attempts + "\n" +
@@ -885,7 +893,7 @@ public final class MainActivity extends Activity {
             padded(content, resume, 12);
             resume.setEnabled(!running && !"выполняется".equals(mission.status));
             resume.setOnClickListener(v -> confirmResume(mission));
-            Button stop = button("■ ПРИОСТАНОВИТЬ (ПОСЛЕ ТЕКУЩЕГО ШАГА)", false);
+            Button stop = button("■ ОСТАНОВИТЬ АКТИВНУЮ ЗАДАЧУ", false);
             padded(content, stop, 9);
             stop.setEnabled(running);
             stop.setOnClickListener(v -> {
@@ -894,6 +902,8 @@ public final class MainActivity extends Activity {
             });
             Button report = button("⇩ ЭКСПОРТ ОТЧЁТА МИССИИ", false);
             padded(content, report, 9);
+            padded(content, text("Экспорт может содержать текст приватного задания — " +
+                    "сохраняй отчёт только в доверенном месте.", 11, MUTED, false), 4);
             report.setOnClickListener(v -> {
                 pendingMissionExportId = mission.id;
                 Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
