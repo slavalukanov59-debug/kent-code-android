@@ -81,6 +81,7 @@ public final class MainActivity extends Activity {
     private LinearLayout mainArea;
     private LinearLayout chatFeed;
     private ScrollView chatScroll;
+    private int savedChatScrollY = 0;
     private EditText composer;
     private TextView runStatus;
     private int tab = 0;
@@ -318,6 +319,7 @@ public final class MainActivity extends Activity {
 
         chatScroll = new ScrollView(this);
         chatScroll.setFillViewport(true);
+        chatScroll.setOnScrollChangeListener((View v, int x, int y, int ox, int oy) -> savedChatScrollY = y);
         chatFeed = vertical();
         chatFeed.setPadding(dp(10), dp(5), dp(10), dp(8));
         chatScroll.addView(chatFeed);
@@ -423,7 +425,7 @@ public final class MainActivity extends Activity {
         if (chatFeed == null) return;
         chatFeed.removeAllViews();
         for (ChatItem item : messages) appendBubble(item.title, item.text);
-        // Keep scroll at its current reading position (no automatic jump).
+        if (chatScroll != null) chatScroll.post(() -> chatScroll.scrollTo(0, savedChatScrollY));
     }
 
     private void appendBubble(String who, String message) {
@@ -475,7 +477,7 @@ public final class MainActivity extends Activity {
                 running = false;
                 runOnUiThread(() -> {
                     if (tab == 0 && runStatus != null) runStatus.setText("🟢 Готов к задачам");
-                    requestCredits(false);
+                    requestCredits(true);
                     if (tab == 4 && !isFinishing() && !isDestroyed()) draw();
                 });
             }
