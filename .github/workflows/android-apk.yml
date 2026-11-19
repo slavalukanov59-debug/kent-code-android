@@ -36,10 +36,13 @@ jobs:
             tests/WorkspaceSmokeTest.java \
             tests/ShellRunnerSmokeTest.java \
             app/src/main/java/ai/kent/code/ApiKeyValidator.java \
-            tests/ApiKeyValidatorSmokeTest.java
+            tests/ApiKeyValidatorSmokeTest.java \
+            app/src/main/java/ai/kent/code/ApiRetryPolicy.java \
+            tests/ApiRetryPolicySmokeTest.java
           java -cp /tmp/kent-tests ai.kent.code.WorkspaceSmokeTest
           java -cp /tmp/kent-tests ai.kent.code.ShellRunnerSmokeTest
           java -cp /tmp/kent-tests ai.kent.code.ApiKeyValidatorSmokeTest
+          java -cp /tmp/kent-tests ai.kent.code.ApiRetryPolicySmokeTest
       - name: Test local bridge
         run: python3 tests/test_kent_bridge.py
       # ubuntu-latest has the Android SDK command-line tools preinstalled.
