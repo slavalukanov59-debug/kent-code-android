@@ -192,23 +192,19 @@ public final class KentAgent {
         history.put(message("user", instruction));
         int toolActions = 0;
         long billedTokensOrEstimate = 0;
-        int budget = secrets.taskTokenBudget();
-        tokenMeter.begin(secrets.provider(), budget);
+        // No client-side token spending limit. Real billing is controlled by
+        // the provider's account; retain usage only for mission diagnostics.
+        tokenMeter.begin(secrets.provider(), 0);
         events.usage(tokenMeter.snapshot());
         boolean failed = false;
-        String missionStatus = "пауза: лимит API-шагов";
+        String missionStatus = "пауза: технический предел";
         try {
-        for (int n = 0; n < secrets.steps(); n++) {
+        // Technical runaway guard; not a token or currency quota.
+        // Explicit Stop remains available to the user.
+        for (int n = 0; n < 500; n++) {
             if (events.cancelled()) {
                 missionStatus = "остановлена";
                 events.log("Остановка", "Задача отменена. Изменённые файлы и журнал сохраняются.");
-                return;
-            }
-            if (billedTokensOrEstimate >= budget) {
-                missionStatus = "пауза: лимит токенов";
-                events.log("Лимит токенов", "Остановлено для защиты баланса: примерно " +
-                        billedTokensOrEstimate + " / " + budget +
-                        " токенов за задачу. Проверь Git и PROGRESS.md; продолжай отдельным запросом.");
                 return;
             }
             try {
@@ -244,9 +240,6 @@ public final class KentAgent {
                 if (calls == null || calls.length() == 0) {
                     missionStatus = "ответ получен";
                     if (answer.trim().isEmpty()) events.log("КЕНТ", "Пустой ответ модели. Попробуй другую модель.");
-                    events.log("Расход", "Токены задачи: примерно " + billedTokensOrEstimate +
-                            " / лимит " + budget +
-                            ". Точное списание смотри в AI-FLEX.");
                     return;
                 }
                 for (int i = 0; i < calls.length(); i++) {
@@ -277,15 +270,11 @@ public final class KentAgent {
                         safe.contains("header value:"))
                     safe = "Неверный API-ключ в CTRL. Проверь ключ выбранного провайдера и сохрани заново.";
                 events.log("Ошибка API", safe.substring(0, Math.min(1100, safe.length())));
-                events.log("Расход", "Примерно " + billedTokensOrEstimate +
-                        " токенов в этой задаче. Рабочие файлы не очищались.");
                 return;
             }
         }
-        events.log("Лимит шагов", "Достигнут предел " + secrets.steps() +
-                " обращений. Токены задачи: примерно " + billedTokensOrEstimate +
-                " / " + budget +
-                ". Для продолжения проверь Git и PROGRESS.md, запусти новую короткую задачу.");
+        events.log("Технический предел", "Выполнено 500 API-шагов. " +
+                "Файлы и контрольные точки сохранены; для продолжения открой JOBS.");
         } finally {
             if (events.cancelled()) missionStatus = "остановлена";
             missionStore.finish(missionStatus);
