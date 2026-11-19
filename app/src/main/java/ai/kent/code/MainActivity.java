@@ -98,6 +98,10 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Own the insets so keyboard and system-bar padding are applied once.
+            getWindow().setDecorFitsSystemWindows(false);
+        }
         try {
             workspace = new SafeWorkspace(new java.io.File(getFilesDir(), "workspace"));
             secrets = new SecureKeyStore(this);
