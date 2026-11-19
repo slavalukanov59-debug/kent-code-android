@@ -291,9 +291,10 @@ public final class KentAgent {
         // Old installations may already contain a pasted multiline prompt in
         // encrypted settings. Do not let it reach Authorization or error logs.
         SecureKeyStore.validateApiKey(apiKey);
+        // Do not impose a client-side output-token cap. The selected
+        // provider/model still applies its own limits and billing.
         JSONObject payload = new JSONObject().put("model", secrets.model()).put("messages", history)
-                .put("tools", tools()).put("tool_choice", "auto")
-                .put("max_tokens", secrets.responseTokens());
+                .put("tools", tools()).put("tool_choice", "auto");
         if (provider.equals("openrouter")) {
             // Avoid routing to endpoints that silently drop required tool calls.
             payload.put("provider", new JSONObject().put("require_parameters", true));
