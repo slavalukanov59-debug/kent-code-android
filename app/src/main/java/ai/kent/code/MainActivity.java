@@ -904,7 +904,6 @@ public final class MainActivity extends Activity {
             padded(details, text("Модель: " + mission.model + " · API: " + mission.calls +
                     " · Инструменты: " + mission.tools +
                     "\nСессии: " + mission.attempts +
-                    " · Примерно токенов: " + tokens(mission.tokens) +
                     "\nПоследний инструмент: " + mission.lastTool, 11, MUTED, false), 8);
             padded(content, card, 9);
 
@@ -1011,7 +1010,6 @@ public final class MainActivity extends Activity {
                     "\nAPI REQUESTS: " + mission.calls +
                     "\nTOOLS: " + mission.tools +
                     "\nSESSIONS: " + mission.attempts +
-                    "\nAPPROX TOKENS ACROSS SESSIONS: " + mission.tokens +
                     "\nLAST TOOL: " + mission.lastTool +
                     "\n\nWARNING: this is an AI-reported checkpoint, not proof of tests passing.\n";
             try (java.io.OutputStream out = getContentResolver().openOutputStream(target, "w")) {
