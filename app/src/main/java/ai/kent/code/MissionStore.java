@@ -33,7 +33,7 @@ public final class MissionStore {
 
     public static final class Mission {
         public String id, goal, provider, model, status, stage, summary, next, lastTool;
-        public int completed, total, calls, tools, attempts;
+        public int completed, total, calls, tools, attempts, lastSessionCalls;
         public long tokens, lastSessionTokens, created, updated;
 
         Mission(String goal, String provider, String model) {
@@ -70,6 +70,7 @@ public final class MissionStore {
             calls = j.optInt("calls", 0);
             tools = j.optInt("tools", 0);
             attempts = j.optInt("attempts", 0);
+            lastSessionCalls = j.optInt("lastSessionCalls", 0);
             tokens = j.optLong("tokens", 0);
             lastSessionTokens = j.optLong("lastSessionTokens", 0);
             created = j.optLong("created", 0);
@@ -93,6 +94,7 @@ public final class MissionStore {
                 j.put("calls", calls);
                 j.put("tools", tools);
                 j.put("attempts", attempts);
+                j.put("lastSessionCalls", lastSessionCalls);
                 j.put("tokens", tokens);
                 j.put("lastSessionTokens", lastSessionTokens);
                 j.put("created", created);
@@ -201,6 +203,7 @@ public final class MissionStore {
         if ("выполняется".equals(m.status)) throw new IllegalStateException("Задача уже выполняется");
         m.attempts++;
         m.lastSessionTokens = 0;
+        m.lastSessionCalls = 0;
         m.status = "выполняется";
         m.updated = System.currentTimeMillis();
         persist();
@@ -256,7 +259,9 @@ public final class MissionStore {
             m.tokens += usage.used - m.lastSessionTokens;
         }
         m.lastSessionTokens = usage.used;
-        m.calls = Math.max(m.calls, 0) + (usage.calls > 0 ? 1 : 0);
+        if (usage.calls >= m.lastSessionCalls)
+            m.calls += usage.calls - m.lastSessionCalls;
+        m.lastSessionCalls = usage.calls;
         m.updated = System.currentTimeMillis();
         persist();
     }
