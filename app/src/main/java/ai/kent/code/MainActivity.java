@@ -438,7 +438,23 @@ public final class MainActivity extends Activity {
         int fill = who.equals("ТЫ") ? Color.rgb(73, 18, 35) : PANEL;
         card.setBackground(shape(fill, 4));
         card.addView(text(who, 11, who.startsWith("Ошибка") ? GOLD : BLUE, true));
-        padded(card, text(message, 13, WHITE, false), 3);
+        // Long agent reports and the user's giant project prompts should not
+        // take over the whole screen unless the reader explicitly expands.
+        int previewLimit = who.startsWith("ТЫ") ? 340 : 850;
+        String shortText = message.length() > previewLimit
+                ? message.substring(0, previewLimit) + "\n…" : message;
+        TextView body = text(shortText, 13, WHITE, false);
+        body.setTextIsSelectable(true);
+        padded(card, body, 3);
+        if (message.length() > previewLimit) {
+            Button expand = button("▸ ПОКАЗАТЬ ПОЛНОСТЬЮ", false);
+            padded(card, expand, 5);
+            expand.setOnClickListener(v -> {
+                boolean full = !message.equals(body.getText().toString());
+                body.setText(full ? message : shortText);
+                expand.setText(full ? "▾ СВЕРНУТЬ" : "▸ ПОКАЗАТЬ ПОЛНОСТЬЮ");
+            });
+        }
         LinearLayout.LayoutParams box = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         box.bottomMargin = dp(6);
