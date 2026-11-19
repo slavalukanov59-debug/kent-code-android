@@ -943,6 +943,8 @@ public final class MainActivity extends Activity {
                 .setMessage("Модельный контекст предыдущего запуска утрачен. " +
                         "Кент должен сверить реальное состояние файлов и Git перед изменениями. " +
                         "Это новый платный запрос к " + secrets.provider() + " с отдельным лимитом токенов. " +
+                        (secrets.autopilotEnabled() ?
+                                "⚠ AUTOPILOT ВКЛЮЧЁН: следующие команды могут исполняться без дополнительных подтверждений. " : "") +
                         "Не запускай, если предыдущие процессы Termux ещё работают.")
                 .setNegativeButton("Отмена", null)
                 .setPositiveButton("ПРОДОЛЖИТЬ", (d, w) -> {
@@ -951,7 +953,7 @@ public final class MainActivity extends Activity {
                         if (secrets.loadActiveKey().isBlank()) {
                             toast("Сначала сохрани ключ в CTRL"); return;
                         }
-                        MissionStore.Mission active = missionStore.resume(chosen.id);
+                        MissionStore.Mission active = missionStore.resume(chosen.id, secrets.provider(), secrets.model());
                         String prompt = "ПРОДОЛЖЕНИЕ МИССИИ " + active.shortId() + ". " +
                                 "Исходная задача:\n" + active.goal + "\n\n" +
                                 "Последний подтверждённый ИИ этап: " + active.stage +
