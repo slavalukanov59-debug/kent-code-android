@@ -12,7 +12,7 @@ import java.util.Locale;
 
 /** Read-only credit balances with a provider-specific response schema. */
 public final class CreditBalance {
-    public static final String UNKNOWN_LABEL = "Баланс: неизвестно";
+    public static final String UNKNOWN_LABEL = "БАЛАНС: НЕИЗВЕСТНО";
     private static final int MAX_RESPONSE_BYTES = 64_000;
 
     private CreditBalance() {}
