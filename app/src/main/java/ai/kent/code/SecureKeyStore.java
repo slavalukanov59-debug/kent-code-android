@@ -29,7 +29,8 @@ public final class SecureKeyStore {
         ApiKeyValidator.check(value);
     }
 
-    private SecretKey key() throws Exception {
+    // The alias is shared by all providers and activity instances.
+    private static synchronized SecretKey key() throws Exception {
         KeyStore store = KeyStore.getInstance("AndroidKeyStore");
         store.load(null);
         if (store.containsAlias(ALIAS)) return (SecretKey) store.getKey(ALIAS, null);
@@ -43,7 +44,7 @@ public final class SecureKeyStore {
     }
 
     public void save(String secret) throws Exception {
-        if (secret == null || secret.isBlank()) {
+        if (secret == null || secret.trim().isEmpty()) {
             prefs.edit().remove("api_key").apply();
             return;
         }
@@ -107,7 +108,7 @@ public final class SecureKeyStore {
     public void saveProviderKey(String id, String value) throws Exception {
         if (id.equals("ai_flex")) { save(value); return; }
         if (!id.equals("openrouter")) throw new IllegalArgumentException("Провайдер не поддерживается");
-        if (value == null || value.isBlank()) {
+        if (value == null || value.trim().isEmpty()) {
             prefs.edit().remove("openrouter_key").apply();
             return;
         }
@@ -120,25 +121,38 @@ public final class SecureKeyStore {
                 Base64.encodeToString(encrypted, Base64.NO_WRAP)).apply();
     }
 
-    public int responseTokens() { return Math.max(512, Math.min(8192, prefs.getInt("response_tokens", 4096))); }
-    public void responseTokens(int n) { prefs.edit().putInt("response_tokens",
-            Math.max(512, Math.min(8192, n))).apply(); }
+    public boolean hasGitHubToken() { return prefs.contains("github_token"); }
 
-    /** Soft limit counted from API usage when available, conservatively estimated otherwise. */
-    public int taskTokenBudget() {
-        return Math.max(10_000, Math.min(300_000, prefs.getInt("task_token_budget", 80_000)));
-    }
-    public void taskTokenBudget(int tokens) {
-        prefs.edit().putInt("task_token_budget",
-                Math.max(10_000, Math.min(300_000, tokens))).apply();
+    public void saveGitHubToken(String token) throws Exception {
+        String value = token == null ? "" : token.trim();
+        SharedPreferences.Editor edit = prefs.edit();
+        if (value.isEmpty()) {
+            edit.remove("github_token");
+        } else {
+            GitHubClient.validateToken(value);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, key());
+            byte[] encrypted = cipher.doFinal(value.getBytes(StandardCharsets.UTF_8));
+            edit.putString("github_token", Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP) + ":" +
+                    Base64.encodeToString(encrypted, Base64.NO_WRAP));
+        }
+        if (!edit.commit()) throw new IllegalStateException("Не удалось сохранить настройки токена GitHub.");
     }
 
-    public int steps() { return Math.max(1, Math.min(500, prefs.getInt("steps", 40))); }
-    public void steps(int count) { prefs.edit().putInt("steps", Math.max(1, Math.min(500, count))).apply(); }
+    public String loadGitHubToken() throws Exception {
+        String packed = prefs.getString("github_token", "");
+        if (packed == null || packed.isEmpty()) return "";
+        String[] parts = packed.split(":", 2);
+        if (parts.length != 2) throw new IllegalStateException("Не удалось прочитать сохранённый токен GitHub.");
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128,
+                Base64.decode(parts[0], Base64.NO_WRAP)));
+        return new String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), StandardCharsets.UTF_8);
+    }
 
     /** Loopback token encrypted with the same AndroidKeystore AES key as API credentials. */
     public void saveBridgeToken(String value) throws Exception {
-        if (value == null || value.isBlank()) {
+        if (value == null || value.trim().isEmpty()) {
             prefs.edit().remove("bridge_token").apply();
             return;
         }
@@ -166,12 +180,10 @@ public final class SecureKeyStore {
     public boolean bridgeEnabled() { return prefs.getBoolean("termux_bridge_enabled", false); }
     public void bridgeEnabled(boolean enabled) { prefs.edit().putBoolean("termux_bridge_enabled", enabled).apply(); }
 
-    /** Explicit owner opt-in: agent tool approvals are automatic while enabled. */
+    /** Explicit opt-in for text writes within the default workspace on a new mission. */
     public boolean autopilotEnabled() { return prefs.getBoolean("autopilot_enabled", false); }
     public void autopilotEnabled(boolean enabled) {
         prefs.edit().putBoolean("autopilot_enabled", enabled).apply();
     }
 
-    public boolean trustedMode() { return prefs.getBoolean("trusted_mode", false); }
-    public void trustedMode(boolean enabled) { prefs.edit().putBoolean("trusted_mode", enabled).apply(); }
 }

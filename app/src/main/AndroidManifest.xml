@@ -5,12 +5,14 @@
     <queries><package android:name="com.termux" /></queries>
     <application
         android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/kent_data_extraction_rules"
         android:usesCleartextTraffic="false"
         android:label="KENT CODE RED"
         android:icon="@drawable/ic_kent"
         android:theme="@style/KentTheme"
         android:supportsRtl="true">
-        <service android:name=".TermuxResultService" android:exported="false" />
+        <receiver android:name=".TermuxResultReceiver" android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

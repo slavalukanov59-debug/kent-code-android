@@ -8,11 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
-/**
- * Executes commands with the normal Android app UID, not root. NEVER call this
- * before showing the user the entire command and receiving one-time approval.
- * Commands can access private app files, so automatic approval is not supported.
- */
+/** Runs an explicitly approved command with the app UID. Cwd is not a sandbox. */
 public final class ShellRunner {
     private static final int MAX_OUTPUT = 24_000;
     private final File workDir;
@@ -20,59 +16,67 @@ public final class ShellRunner {
     public ShellRunner(File workDir) { this.workDir = workDir; }
 
     public String run(String command, int requestedSeconds, BooleanSupplier cancelled) throws IOException {
-        if (command == null || command.isBlank() || command.length() > 5000 || command.indexOf('\0') >= 0)
-            throw new IOException("Команда пуста или некорректна (максимум 5000 символов)");
-        int seconds = Math.max(1, Math.min(120, requestedSeconds));
+        return runResult(command, requestedSeconds, cancelled).display();
+    }
+
+    public CommandResult runResult(String command, int requestedSeconds, BooleanSupplier cancelled) throws IOException {
+        CommandResult.validateCommand(command);
+        if (CommandResult.cancelled(cancelled))
+            return CommandResult.stopped(CommandResult.Status.CANCELLED, "Запуск отменён до создания процесса.", false);
+        int seconds = CommandResult.timeout(requestedSeconds);
         File androidShell = new File("/system/bin/sh");
         File shell = androidShell.isFile() ? androidShell : new File("/bin/sh");
-        ProcessBuilder pb = new ProcessBuilder(shell.getPath(), "-c", command);
-        pb.directory(workDir);
-        pb.redirectErrorStream(true);
-        Process process = pb.start();
-        final ByteArrayOutputStream capture = new ByteArrayOutputStream();
-        final boolean[] truncated = {false};
-        Thread reader = new Thread(() -> {
-            try (InputStream stream = process.getInputStream()) {
-                byte[] chunk = new byte[4096];
-                int n;
-                while ((n = stream.read(chunk)) >= 0) {
-                    synchronized (capture) {
-                        int allowed = Math.max(0, MAX_OUTPUT - capture.size());
-                        if (n > allowed) truncated[0] = true;
-                        if (allowed > 0) capture.write(chunk, 0, Math.min(n, allowed));
-                    }
-                }
-            } catch (IOException ignored) { }
-        }, "kent-command-output");
-        reader.setDaemon(true);
-        reader.start();
-        boolean done = false;
-        boolean stopped = false;
+        Process process = new ProcessBuilder(shell.getPath(), "-c", command)
+                .directory(workDir)
+                .redirectErrorStream(true)
+                .start();
+        ByteArrayOutputStream capture = new ByteArrayOutputStream();
+        byte[] chunk = new byte[4096];
+        boolean truncated = false;
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
-        try {
-            while (!(done = process.waitFor(150, TimeUnit.MILLISECONDS))) {
-                if (cancelled.getAsBoolean() || Thread.currentThread().isInterrupted()) {
-                    stopped = true;
+        try (InputStream stream = process.getInputStream()) {
+            process.getOutputStream().close();
+            while (true) {
+                int ready = stream.available();
+                if (ready > 0) {
+                    int read = stream.read(chunk, 0, Math.min(chunk.length, ready));
+                    if (read < 0) break;
+                    int allowed = Math.min(read, MAX_OUTPUT - capture.size());
+                    capture.write(chunk, 0, allowed);
+                    truncated |= read > allowed;
+                } else if (!process.isAlive()) {
                     break;
+                } else {
+                    process.waitFor(25, TimeUnit.MILLISECONDS);
                 }
-                if (System.nanoTime() >= deadline) break;
+                if (CommandResult.cancelled(cancelled)) {
+                    process.destroyForcibly();
+                    return CommandResult.stopped(CommandResult.Status.CANCELLED, output(capture, truncated), true);
+                }
+                if (System.nanoTime() >= deadline) {
+                    process.destroyForcibly();
+                    return CommandResult.stopped(CommandResult.Status.TIMED_OUT, output(capture, truncated), true);
+                }
             }
-            if (!done) {
+            if (!process.waitFor(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
                 process.destroyForcibly();
-                process.waitFor(2, TimeUnit.SECONDS);
+                return CommandResult.stopped(CommandResult.Status.TIMED_OUT, output(capture, truncated), true);
             }
-            reader.join(1000);
+            return CommandResult.exited(process.exitValue(), output(capture, truncated));
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
             process.destroyForcibly();
-            throw new IOException("Команда прервана", e);
+            Thread.currentThread().interrupt();
+            return CommandResult.stopped(CommandResult.Status.CANCELLED, output(capture, truncated), true);
+        } catch (IOException e) {
+            process.destroyForcibly();
+            return CommandResult.stopped(CommandResult.Status.UNKNOWN, output(capture, truncated), true);
         } finally {
-            process.destroy();
+            if (process.isAlive()) process.destroyForcibly();
         }
-        String output;
-        synchronized (capture) { output = new String(capture.toByteArray(), StandardCharsets.UTF_8); }
-        String status = stopped ? "ОСТАНОВЛЕНО" : done ? "Exit code: " + process.exitValue() : "ТАЙМАУТ: " + seconds + " сек";
-        if (truncated[0]) output += "\n[Вывод сокращён до 24 KB]";
-        return status + "\n" + (output.isBlank() ? "[Нет вывода]" : output);
+    }
+
+    private static String output(ByteArrayOutputStream capture, boolean truncated) {
+        return new String(capture.toByteArray(), StandardCharsets.UTF_8)
+                + (truncated ? "\n[Вывод сокращён до 24 КБ]" : "");
     }
 }
