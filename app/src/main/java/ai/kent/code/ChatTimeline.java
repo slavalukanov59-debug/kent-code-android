@@ -7,6 +7,7 @@ import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.AbsListView;
 import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.HorizontalScrollView;
@@ -81,6 +82,8 @@ final class ChatTimeline extends ListView {
 
     private final MessageAdapter rows;
     private Anchor waitingForLayout;
+    private boolean pinnedToLatest = true;
+    private boolean userScrolling;
 
     ChatTimeline(Context context, Set<String> expanded) {
         super(context);
@@ -93,6 +96,20 @@ final class ChatTimeline extends ListView {
         setVerticalScrollBarEnabled(true);
         rows = new MessageAdapter(expanded);
         setAdapter(rows);
+        setOnScrollListener(new OnScrollListener() {
+            @Override public void onScrollStateChanged(AbsListView view, int state) {
+                if (waitingForLayout != null) return;
+                if (state != SCROLL_STATE_IDLE) {
+                    userScrolling = true;
+                    pinnedToLatest = false;
+                } else if (userScrolling) {
+                    userScrolling = false;
+                    pinnedToLatest = atBottom(getHeight());
+                }
+            }
+
+            @Override public void onScroll(AbsListView view, int first, int visible, int count) { }
+        });
     }
 
     private int dp(int value) {
@@ -107,11 +124,14 @@ final class ChatTimeline extends ListView {
         int first = getFirstVisiblePosition();
         int children = getChildCount();
         if (children == 0 || first >= rows.getCount()) return Anchor.latest();
-        if (followLatest && getLastVisiblePosition() == rows.getCount() - 1
-                && getChildAt(children - 1).getBottom() <= viewportHeight - getListPaddingBottom() + dp(24)) {
-            return Anchor.latest();
-        }
+        if (followLatest && (pinnedToLatest || atBottom(viewportHeight))) return Anchor.latest();
         return new Anchor(rows.getItem(first).id, first, getChildAt(0).getTop() - getListPaddingTop(), false);
+    }
+
+    private boolean atBottom(int viewportHeight) {
+        int children = getChildCount();
+        return children == 0 || (getLastVisiblePosition() == rows.getCount() - 1
+                && getChildAt(children - 1).getBottom() <= viewportHeight - getListPaddingBottom() + dp(24));
     }
 
     void setMessages(List<Message> messages, Anchor position) {
@@ -127,6 +147,7 @@ final class ChatTimeline extends ListView {
 
     private void restore(Anchor anchor) {
         waitingForLayout = anchor;
+        pinnedToLatest = anchor.latest;
         if (rows.getCount() == 0) return;
         if (anchor.latest) {
             setSelection(rows.getCount() - 1);

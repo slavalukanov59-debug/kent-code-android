@@ -10,6 +10,7 @@ import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
@@ -22,11 +23,12 @@ public final class ChatJournalTest {
     @Test public void recentKeepsOrderAndIdentityAcrossAnIncompleteRecord() throws Exception {
         File root = directory.newFolder();
         File file = new File(root, "kent_chat.jsonl");
-        Files.write(file.toPath(), ("{\"time\":1,\"title\":\"ТЫ\",\"text\":\"Старое сообщение\"}\n").getBytes(StandardCharsets.UTF_8));
+        Files.write(file.toPath(), "{\"time\":1,\"title\":\"ТЫ\",\"text\":\"Старое сообщение\"}\n"
+                .getBytes(StandardCharsets.UTF_8));
         ChatJournal journal = new ChatJournal(root);
         String legacyId = journal.recent(1).get(0).id;
         ChatJournal.Record first = journal.append("КЕНТ", "Первая строка\nВторая строка");
-        Files.write(file.toPath(), ("{\"text\":\"оборван").getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+        Files.write(file.toPath(), "{\"text\":\"оборван".getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
         ChatJournal.Record second = journal.append("ТЫ", "Продолжить");
         List<ChatJournal.Record> rows = new ChatJournal(root).recent(3);
         assertEquals(3, rows.size());
@@ -48,7 +50,9 @@ public final class ChatJournalTest {
 
     @Test public void displayPreviewBoundDoesNotChangeExportedRecord() throws Exception {
         ChatJournal journal = new ChatJournal(directory.newFolder());
-        String text = "x".repeat(32_000) + "конец";
+        char[] prefix = new char[32_000];
+        Arrays.fill(prefix, 'x');
+        String text = new String(prefix) + "конец";
         journal.append("КЕНТ", text);
         assertFalse(journal.recent(1).get(0).text.endsWith("конец"));
         ByteArrayOutputStream output = new ByteArrayOutputStream();
