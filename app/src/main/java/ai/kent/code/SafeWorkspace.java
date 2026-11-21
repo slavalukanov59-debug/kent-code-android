@@ -4,10 +4,13 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 
 /** Only app-private project files. This is not a sandbox for arbitrary shell commands. */
 public final class SafeWorkspace {
@@ -26,40 +29,52 @@ public final class SafeWorkspace {
         if (path == null || path.trim().isEmpty() || path.startsWith("/") || path.contains("\\") || path.indexOf('\u0000') != -1) {
             throw new IOException("Нужен относительный путь внутри рабочего каталога");
         }
-        File file = new File(root, path).getCanonicalFile();
-        String base = root.getCanonicalPath() + File.separator;
-        if (!file.getCanonicalPath().startsWith(base)) {
-            throw new IOException("Выход за пределы рабочей папки запрещён");
+        for (int i = 0; i < path.length(); i++) {
+            if (Character.isISOControl(path.charAt(i))) throw new IOException("Недопустимый символ в пути");
         }
-        return file;
+        Path target = root.toPath();
+        for (String component : path.split("/", -1)) {
+            if (component.isEmpty() || ".".equals(component) || "..".equals(component)) {
+                throw new IOException("Нужен относительный путь внутри рабочего каталога");
+            }
+            target = target.resolve(component);
+            if (Files.isSymbolicLink(target)) throw new IOException("Символические ссылки недоступны");
+        }
+        return target.toFile();
     }
 
     private void rejectSecret(String path) throws IOException {
-        String p = "/" + path.toLowerCase().replace('\\', '/');
+        String p = "/" + path.toLowerCase(Locale.ROOT).replace('\\', '/');
         String name = p.substring(p.lastIndexOf('/') + 1);
         if (name.equals(".env") || name.startsWith(".env.") || name.equals(".npmrc") ||
             name.equals(".netrc") || name.equals("credentials.json") || name.equals("secrets.json") ||
             name.equals("id_rsa") || name.equals("id_ed25519") || name.equals("local.properties") ||
             name.endsWith(".pem") || name.endsWith(".key") || name.endsWith(".jks") ||
             name.endsWith(".keystore") || name.endsWith(".p12") || name.endsWith(".pfx") ||
-            p.contains("/.git/") || p.contains("/.gradle/")) {
+            p.contains("/.git/") || p.contains("/.gradle/") || name.equals(".git") ||
+            name.equals(".gradle") || name.startsWith(".kent-")) {
             throw new IOException("Файл с секретами/служебными данными не доступен агенту");
         }
     }
 
-    public String read(String path) throws IOException {
-        rejectSecret(path);
+    public synchronized String read(String path) throws IOException {
         File file = resolve(path);
+        rejectSecret(path);
         if (!file.isFile()) throw new IOException("Файл не существует: " + path);
         if (file.length() > MAX_READ_BYTES) throw new IOException("Слишком большой файл для чтения (>120 KB)");
-        return new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+        byte[] bytes = Files.readAllBytes(file.toPath());
+        try {
+            return StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(bytes)).toString();
+        } catch (java.nio.charset.CharacterCodingException e) {
+            throw new IOException("Доступны текстовые файлы UTF-8");
+        }
     }
 
     public String readPreview(String path) throws IOException { return read(path); }
 
-    public void write(String path, String content) throws IOException {
-        rejectSecret(path);
+    public synchronized void write(String path, String content) throws IOException {
         File file = resolve(path);
+        rejectSecret(path);
         if (file.exists() && !file.isFile()) throw new IOException("Путь занят папкой");
         byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
         if (bytes.length > MAX_WRITE_BYTES) throw new IOException("Слишком большой файл (>250 KB)");
@@ -80,9 +95,22 @@ public final class SafeWorkspace {
         }
     }
 
-    public void delete(String path) throws IOException {
+    synchronized String currentText(String path) throws IOException {
+        File file = resolve(path);
         rejectSecret(path);
+        return file.exists() ? read(path) : null;
+    }
+
+    synchronized boolean applyReviewedChange(String path, String before, String after) throws IOException {
+        if (!Objects.equals(currentText(path), before)) return false;
+        if (after == null) delete(path);
+        else write(path, after);
+        return true;
+    }
+
+    public synchronized void delete(String path) throws IOException {
         File f = resolve(path);
+        rejectSecret(path);
         if (!f.isFile()) throw new IOException("Можно удалять только обычные файлы");
         Files.delete(f.toPath());
     }
@@ -114,9 +142,9 @@ public final class SafeWorkspace {
             if (count[0] >= 240) break;
             String name = file.getName();
             if (name.equals(".git") || name.equals(".gradle") || name.equals("node_modules") || name.equals("build")) continue;
-            File safe = file.getCanonicalFile();
-            if (!safe.getPath().startsWith(root.getPath() + File.separator)) continue;
             String relative = prefix + name;
+            if (Files.isSymbolicLink(file.toPath())) continue;
+            try { rejectSecret(relative); } catch (IOException e) { continue; }
             sb.append(relative).append(file.isDirectory() ? "/" : "").append('\n');
             count[0]++;
             if (file.isDirectory()) walk(file, relative + "/", sb, count, depth + 1);
@@ -125,7 +153,9 @@ public final class SafeWorkspace {
 
     public List<String> filePaths() throws IOException {
         List<String> list = new ArrayList<>();
-        for (String l : tree().split("\n")) {
+        String tree = tree();
+        if (tree.startsWith("Пока пусто.")) return list;
+        for (String l : tree.split("\n")) {
             if (!l.trim().isEmpty() && !l.endsWith("/") && !l.startsWith("…")) list.add(l);
         }
         return list;
@@ -133,6 +163,7 @@ public final class SafeWorkspace {
 
     public String search(String query) throws IOException {
         if (query == null || query.trim().isEmpty()) return "Пустой запрос";
+        String needle = query.toLowerCase(Locale.ROOT);
         StringBuilder out = new StringBuilder();
         int found = 0;
         for (String path : filePaths()) {
@@ -140,7 +171,7 @@ public final class SafeWorkspace {
             try { content = read(path); } catch (IOException ignored) { continue; }
             String[] lines = content.split("\n", -1);
             for (int i = 0; i < lines.length && found < 40; i++) {
-                if (lines[i].toLowerCase().contains(query.toLowerCase())) {
+                if (lines[i].toLowerCase(Locale.ROOT).contains(needle)) {
                     out.append(path).append(':').append(i + 1).append(": ")
                        .append(lines[i], 0, Math.min(180, lines[i].length())).append('\n');
                     found++;

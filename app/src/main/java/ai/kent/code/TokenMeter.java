@@ -3,11 +3,11 @@ package ai.kent.code;
 import android.content.Context;
 import android.content.SharedPreferences;
 
-/**
- * Persistent per-task token meter for the configured client-side budget.
- * This is NOT the AI-FLEX wallet, billing amount, or the model context window.
- * Successful requests use API usage.total_tokens when available; otherwise an estimate.
- */
+import org.json.JSONObject;
+
+import java.math.BigDecimal;
+
+/** Locally persisted accounting for reported usage in the current run. */
 public final class TokenMeter {
     private static final String NAME = "kent_token_meter";
     private final SharedPreferences prefs;
@@ -15,77 +15,113 @@ public final class TokenMeter {
     public static final class Snapshot {
         public final String provider;
         public final String status;
+        public final String model;
+        public final boolean modelReported;
         public final long used;
-        public final long budget;
         public final long input;
         public final long output;
         public final long cumulative;
         public final int calls;
-        public final int estimatedCalls;
-        public Snapshot(String provider, String status, long used, long budget,
-                        long input, long output, long cumulative, int calls, int estimatedCalls) {
-            this.provider = provider;
-            this.status = status;
-            this.used = used;
-            this.budget = budget;
-            this.input = input;
-            this.output = output;
-            this.cumulative = cumulative;
-            this.calls = calls;
-            this.estimatedCalls = estimatedCalls;
+        public final int tokenCalls;
+        public final int inputCalls;
+        public final int outputCalls;
+        public final int costedCalls;
+        public final BigDecimal lastRequestCost;
+        public final BigDecimal sessionCost;
+        private final boolean hasLegacyEstimates;
+
+        private Snapshot(SharedPreferences prefs) {
+            provider = prefs.getString("provider", "ai_flex");
+            status = prefs.getString("status", "нет задач");
+            String reportedModel = prefs.getString("reported_model", "");
+            modelReported = !reportedModel.isEmpty();
+            model = modelReported ? reportedModel : prefs.getString("requested_model", "");
+            used = prefs.getLong("confirmed_used", 0);
+            input = prefs.getLong("confirmed_input", 0);
+            output = prefs.getLong("confirmed_output", 0);
+            cumulative = prefs.getLong(cumulativeKey(provider), 0);
+            calls = prefs.getInt("calls", 0);
+            tokenCalls = prefs.getInt("token_calls", 0);
+            inputCalls = prefs.getInt("input_calls", 0);
+            outputCalls = prefs.getInt("output_calls", 0);
+            costedCalls = prefs.getInt("costed_calls", 0);
+            lastRequestCost = savedAmount(prefs, "last_request_cost");
+            sessionCost = savedAmount(prefs, "session_cost");
+            hasLegacyEstimates = prefs.getInt("estimated_calls", 0) > 0;
         }
-        public long remaining() { return Math.max(0L, budget - used); }
-        public int permille() {
-            return (int) Math.min(1000L, used >= budget ? 1000L : (used * 1000L / Math.max(1L, budget)));
-        }
-        public boolean approximate() { return estimatedCalls > 0; }
+
+        public boolean tokenComplete() { return calls > 0 && calls == tokenCalls; }
+        public boolean inputComplete() { return calls > 0 && calls == inputCalls; }
+        public boolean outputComplete() { return calls > 0 && calls == outputCalls; }
+        public boolean costComplete() { return calls > 0 && calls == costedCalls; }
+        public boolean approximate() { return hasLegacyEstimates; }
     }
 
     public TokenMeter(Context context) {
-        prefs = context.getSharedPreferences(NAME, Context.MODE_PRIVATE);
+        this(context.getSharedPreferences(NAME, Context.MODE_PRIVATE));
+    }
+
+    TokenMeter(SharedPreferences prefs) {
+        this.prefs = prefs;
     }
 
     private static String cumulativeKey(String provider) {
-        return "openrouter".equals(provider) ? "cumulative_openrouter" : "cumulative_ai_flex";
+        // The older counters mixed provider totals with estimates.
+        return "confirmed_cumulative_" + provider;
     }
 
     public synchronized Snapshot snapshot() {
-        String provider = prefs.getString("provider", "ai_flex");
-        return new Snapshot(provider, prefs.getString("status", "нет задач"),
-                prefs.getLong("used", 0), prefs.getLong("budget", 80_000),
-                prefs.getLong("input", 0), prefs.getLong("output", 0),
-                prefs.getLong(cumulativeKey(provider), 0),
-                prefs.getInt("calls", 0), prefs.getInt("estimated_calls", 0));
+        return new Snapshot(prefs);
     }
 
-    /** Called only when a NEW user task is submitted. Does not wipe provider totals. */
-    public synchronized void begin(String provider, int budget) {
+    public synchronized void begin(String provider, String model) {
         prefs.edit()
                 .putString("provider", provider)
                 .putString("status", "выполняется")
-                .putLong("budget", budget)
-                .putLong("used", 0).putLong("input", 0).putLong("output", 0)
-                .putInt("calls", 0).putInt("estimated_calls", 0)
+                .putString("requested_model", model)
+                .remove("reported_model")
+                .putLong("confirmed_used", 0)
+                .putLong("confirmed_input", 0)
+                .putLong("confirmed_output", 0)
+                .putInt("calls", 0)
+                .putInt("token_calls", 0)
+                .putInt("input_calls", 0)
+                .putInt("output_calls", 0)
+                .putInt("costed_calls", 0)
+                .remove("estimated_calls")
+                .remove("last_request_cost")
+                .remove("session_cost")
                 .commit();
     }
 
-    /** Called after each successful API response before executing its tool calls. */
-    public synchronized Snapshot record(long tokens, long promptTokens,
-                                        long completionTokens, boolean estimated) {
+    /** Called for a successful response before executing the returned tool calls. */
+    public synchronized Snapshot record(JSONObject response) {
         Snapshot prior = snapshot();
-        long increment = Math.max(1L, tokens);
-        long inputIncrement = Math.max(0L, promptTokens);
-        long outputIncrement = Math.max(0L, completionTokens);
-        long newUsed = saturatedAdd(prior.used, increment);
-        long newTotal = saturatedAdd(prior.cumulative, increment);
-        prefs.edit()
-                .putLong("used", newUsed)
-                .putLong("input", saturatedAdd(prior.input, inputIncrement))
-                .putLong("output", saturatedAdd(prior.output, outputIncrement))
-                .putLong(cumulativeKey(prior.provider), newTotal)
-                .putInt("calls", prior.calls + 1)
-                .putInt("estimated_calls", prior.estimatedCalls + (estimated ? 1 : 0))
-                .commit();
+        ProviderUsage usage = new ProviderUsage(prior.provider, response);
+        SharedPreferences.Editor edit = prefs.edit()
+                .putString("reported_model", usage.model)
+                .putInt("calls", increment(prior.calls))
+                .remove("last_request_cost");
+        if (usage.total >= 0) {
+            edit.putLong("confirmed_used", saturatedAdd(prior.used, usage.total))
+                    .putLong(cumulativeKey(prior.provider), saturatedAdd(prior.cumulative, usage.total))
+                    .putInt("token_calls", increment(prior.tokenCalls));
+        }
+        if (usage.input >= 0) {
+            edit.putLong("confirmed_input", saturatedAdd(prior.input, usage.input))
+                    .putInt("input_calls", increment(prior.inputCalls));
+        }
+        if (usage.output >= 0) {
+            edit.putLong("confirmed_output", saturatedAdd(prior.output, usage.output))
+                    .putInt("output_calls", increment(prior.outputCalls));
+        }
+        if (usage.cost != null) {
+            BigDecimal session = prior.sessionCost == null ? usage.cost : prior.sessionCost.add(usage.cost);
+            edit.putString("last_request_cost", usage.cost.toPlainString())
+                    .putString("session_cost", session.toPlainString())
+                    .putInt("costed_calls", increment(prior.costedCalls));
+        }
+        edit.commit();
         return snapshot();
     }
 
@@ -93,10 +129,29 @@ public final class TokenMeter {
         prefs.edit().putString("status", status).commit();
     }
 
-    /** Android process was killed mid-task: keep last usage without claiming success. */
+    /** Android process was killed mid-task. Keep the latest reported usage. */
+    public synchronized void clear() {
+        if (!prefs.edit().clear().commit()) throw new IllegalStateException("Не удалось очистить счётчики.");
+    }
+
     public synchronized void recoverInterrupted() {
         if ("выполняется".equals(prefs.getString("status", "")))
             finish("прервана при закрытии приложения");
+    }
+
+    private static BigDecimal savedAmount(SharedPreferences prefs, String key) {
+        String value = prefs.getString(key, null);
+        if (value == null) return null;
+        try {
+            BigDecimal amount = new BigDecimal(value);
+            return amount.signum() < 0 ? null : amount.stripTrailingZeros();
+        } catch (NumberFormatException invalidAmount) {
+            return null;
+        }
+    }
+
+    private static int increment(int count) {
+        return count == Integer.MAX_VALUE ? count : count + 1;
     }
 
     private static long saturatedAdd(long a, long b) {

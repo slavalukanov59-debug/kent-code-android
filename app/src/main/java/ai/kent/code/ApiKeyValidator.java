@@ -9,14 +9,13 @@ public final class ApiKeyValidator {
 
     public static void check(String value) {
         if (value == null || value.trim().isEmpty())
-            throw new IllegalArgumentException("Нет API-ключа: открой CTRL и введи ключ AI-FLEX / OpenRouter");
+            throw new IllegalArgumentException("Добавьте ключ API выбранного провайдера в настройках.");
         if (value.length() > 2048)
-            throw new IllegalArgumentException("Это не похоже на API-ключ. В CTRL вставь только ключ, а задачу отправь в CHAT");
+            throw new IllegalArgumentException("Ключ API превышает допустимую длину.");
         for (int i = 0; i < value.length(); i++) {
             char ch = value.charAt(i);
             if (ch <= 32 || ch >= 127)
-                throw new IllegalArgumentException("API-ключ содержит пробелы, переносы строк или текст задачи. " +
-                        "В CTRL вставь только ключ, задания отправляй в CHAT");
+                throw new IllegalArgumentException("В ключе API допустимы печатные символы ASCII без пробелов.");
         }
     }
 }

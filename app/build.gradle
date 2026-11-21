@@ -2,6 +2,16 @@ plugins {
     id 'com.android.application'
 }
 
+def labAssets = layout.buildDirectory.dir('generated/lab-assets')
+def syncLabSource = tasks.register('syncLabSource', Sync) {
+    from(rootProject.projectDir) {
+        include 'app/src/main/java/**/*.java', 'app/src/main/res/**/*.xml',
+                'app/src/main/AndroidManifest.xml', 'app/build.gradle', 'build.gradle'
+        into 'lab-source'
+    }
+    into labAssets
+}
+
 android {
     namespace 'ai.kent.code'
     compileSdk 35
@@ -10,9 +20,10 @@ android {
         applicationId 'ai.kent.code'
         minSdk 26
         targetSdk 35
-        versionCode 14
-        versionName '0.5.3'
+        versionCode 15
+        versionName '0.6'
     }
+    sourceSets.main.assets.srcDir labAssets
     buildTypes {
         // Experimental GitHub CI debug APKs use ephemeral signing certificates.
         // Keep the original 0.1 app installed when testing RED PIXEL.
@@ -30,4 +41,13 @@ android {
     lint {
         abortOnError true
     }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn syncLabSource
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
 }
