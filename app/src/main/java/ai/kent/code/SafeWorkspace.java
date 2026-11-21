@@ -4,23 +4,37 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 
 /** Only app-private project files. This is not a sandbox for arbitrary shell commands. */
 public final class SafeWorkspace {
     public static final int MAX_READ_BYTES = 120_000;
     public static final int MAX_WRITE_BYTES = 250_000;
     private final File root;
+    private final Path exportAnchor;
+    private final Path exportLocation;
 
     public SafeWorkspace(File rootDir) throws IOException {
         if (!rootDir.exists() && !rootDir.mkdirs()) throw new IOException("Не удалось создать рабочую папку");
         root = rootDir.getCanonicalFile();
+        Path location = rootDir.getAbsoluteFile().toPath().normalize();
+        Path anchor = location;
+        for (int i = 0; i < 2 && anchor.getParent() != null; i++) anchor = anchor.getParent();
+        // Resolve Android's system-managed aliases above the app's private data directory.
+        exportAnchor = anchor.toFile().getCanonicalFile().toPath();
+        exportLocation = anchor.relativize(location);
     }
 
     public File root() { return root; }
+
+    Path exportAnchor() { return exportAnchor; }
+
+    Path exportLocation() { return exportLocation; }
 
     public File resolve(String path) throws IOException {
         if (path == null || path.trim().isEmpty() || path.startsWith("/") || path.contains("\\") || path.indexOf('\u0000') != -1) {
@@ -35,16 +49,19 @@ public final class SafeWorkspace {
     }
 
     private void rejectSecret(String path) throws IOException {
-        String p = "/" + path.toLowerCase().replace('\\', '/');
+        String p = "/" + path.toLowerCase(Locale.ROOT).replace('\\', '/');
         String name = p.substring(p.lastIndexOf('/') + 1);
-        if (name.equals(".env") || name.startsWith(".env.") || name.equals(".npmrc") ||
+        if (isCredentialName(name) || p.contains("/.git/") || p.contains("/.gradle/")) {
+            throw new IOException("Файл с секретами/служебными данными не доступен агенту");
+        }
+    }
+
+    static boolean isCredentialName(String name) {
+        return name.equals(".env") || name.startsWith(".env.") || name.equals(".npmrc") ||
             name.equals(".netrc") || name.equals("credentials.json") || name.equals("secrets.json") ||
             name.equals("id_rsa") || name.equals("id_ed25519") || name.equals("local.properties") ||
             name.endsWith(".pem") || name.endsWith(".key") || name.endsWith(".jks") ||
-            name.endsWith(".keystore") || name.endsWith(".p12") || name.endsWith(".pfx") ||
-            p.contains("/.git/") || p.contains("/.gradle/")) {
-            throw new IOException("Файл с секретами/служебными данными не доступен агенту");
-        }
+            name.endsWith(".keystore") || name.endsWith(".p12") || name.endsWith(".pfx");
     }
 
     public String read(String path) throws IOException {

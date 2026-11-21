@@ -32,14 +32,17 @@ jobs:
           mkdir -p /tmp/kent-tests
           javac -d /tmp/kent-tests \
             app/src/main/java/ai/kent/code/SafeWorkspace.java \
+            app/src/main/java/ai/kent/code/WorkspaceZipExporter.java \
             app/src/main/java/ai/kent/code/ShellRunner.java \
             tests/WorkspaceSmokeTest.java \
+            tests/WorkspaceZipExporterSmokeTest.java \
             tests/ShellRunnerSmokeTest.java \
             app/src/main/java/ai/kent/code/ApiKeyValidator.java \
             tests/ApiKeyValidatorSmokeTest.java \
             app/src/main/java/ai/kent/code/ApiRetryPolicy.java \
             tests/ApiRetryPolicySmokeTest.java
           java -cp /tmp/kent-tests ai.kent.code.WorkspaceSmokeTest
+          java -cp /tmp/kent-tests ai.kent.code.WorkspaceZipExporterSmokeTest
           java -cp /tmp/kent-tests ai.kent.code.ShellRunnerSmokeTest
           java -cp /tmp/kent-tests ai.kent.code.ApiKeyValidatorSmokeTest
           java -cp /tmp/kent-tests ai.kent.code.ApiRetryPolicySmokeTest

@@ -8,12 +8,15 @@ import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
 import android.provider.OpenableColumns;
 import android.text.InputType;
+import android.text.TextUtils;
+import android.text.format.Formatter;
 import android.view.Gravity;
 import android.view.Window;
 import android.view.WindowInsets;
@@ -24,10 +27,12 @@ import android.widget.Button;
 import android.widget.Spinner;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
+import android.widget.BaseAdapter;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.ProgressBar;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -37,11 +42,13 @@ import java.io.InputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -58,8 +65,18 @@ public final class MainActivity extends Activity {
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ExecutorService creditExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService workspaceBrowserExecutor = Executors.newFixedThreadPool(2);
     private final AtomicBoolean stopRequested = new AtomicBoolean(false);
     private SafeWorkspace workspace;
+    private WorkspaceZipExporter workspaceZipExporter;
+    private WorkspaceExportSession workspaceExport;
+    private String workspaceDirectory = "";
+    private ListView workspaceList;
+    private Future<?> workspaceDirectoryTask;
+    private Button workspaceExportButton;
+    private TextView workspaceExportStatus;
+    private AlertDialog workspaceExportDialog;
+    private boolean resumed;
     private SecureKeyStore secrets;
     private KentAgent agent;
     private TermuxBridge bridge;
@@ -69,6 +86,7 @@ public final class MainActivity extends Activity {
     private MissionStore missionStore;
     private String pendingMissionExportId = "";
     private static final int REQ_MISSION_EXPORT = 743;
+    private static final int REQ_WORKSPACE_EXPORT = 744;
     private TextView creditLabel;
     private String creditText = "Кредиты: —";
     private String creditDetail = "";
@@ -105,6 +123,7 @@ public final class MainActivity extends Activity {
         try {
             workspace = new SafeWorkspace(new java.io.File(getFilesDir(), "workspace"));
             secrets = new SecureKeyStore(this);
+            workspaceZipExporter = new WorkspaceZipExporter(workspace);
             journal = new ChatJournal(this);
             tokenMeter = new TokenMeter(this);
             tokenMeter.recoverInterrupted();
@@ -117,6 +136,14 @@ public final class MainActivity extends Activity {
             new AlertDialog.Builder(this).setTitle("Ошибка хранилища")
                     .setMessage(e.getMessage()).setPositiveButton("Закрыть", (d, w) -> finish()).show();
             return;
+        }
+        if (state != null) {
+            tab = state.getInt("workspace_active_tab", 0);
+            workspaceDirectory = state.getString("workspace_directory", "");
+        }
+        workspaceExport = (WorkspaceExportSession) getLastNonConfigurationInstance();
+        if (workspaceExport == null) {
+            workspaceExport = new WorkspaceExportSession(getApplicationContext(), workspaceZipExporter, state);
         }
         for (ChatJournal.Record record : journal.recent(RECENT_CHAT_LIMIT)) {
             messages.add(new ChatItem(record.title, record.text));
@@ -154,7 +181,28 @@ public final class MainActivity extends Activity {
             }
         });
         draw();
+        workspaceExport.listen(this::onWorkspaceExportChanged);
     }
+
+    @Override protected void onResume() {
+        super.onResume();
+        resumed = true;
+        onWorkspaceExportChanged();
+    }
+
+    @Override protected void onPause() {
+        resumed = false;
+        super.onPause();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putInt("workspace_active_tab", tab);
+        outState.putString("workspace_directory", workspaceDirectory);
+        if (workspaceExport != null) workspaceExport.saveState(outState);
+    }
+
+    @Override public Object onRetainNonConfigurationInstance() { return workspaceExport; }
 
     private int dp(int x) { return (int)(x * getResources().getDisplayMetrics().density + .5f); }
 
@@ -216,6 +264,13 @@ public final class MainActivity extends Activity {
     }
 
     private void draw() {
+        if (workspaceDirectoryTask != null) {
+            workspaceDirectoryTask.cancel(true);
+            workspaceDirectoryTask = null;
+        }
+        workspaceList = null;
+        workspaceExportButton = null;
+        workspaceExportStatus = null;
         app = vertical();
         app.setBackgroundColor(BG);
         // Target SDK 35+ draws behind status/navigation bars on Android 15+.
@@ -606,75 +661,287 @@ public final class MainActivity extends Activity {
     }
 
     private void drawFiles() {
-        ScrollView scroll = new ScrollView(this);
-        LinearLayout content = vertical();
-        content.setPadding(dp(16), dp(18), dp(16), dp(18));
-        scroll.addView(content);
-        mainArea.addView(scroll);
-        padded(content, text("📂 Рабочая папка", 22, WHITE, true), 2);
-        padded(content, text("Это отдельное хранилище приложения, другие проекты не затрагиваются.", 13, MUTED, false), 5);
-        LinearLayout row = new LinearLayout(this);
-        Button create = button("+ Новый файл", true);
-        Button importButton = button("⇧ Импорт", false);
-        row.addView(create, new LinearLayout.LayoutParams(0, dp(53), 1));
-        LinearLayout.LayoutParams right = new LinearLayout.LayoutParams(0, dp(53), 1); right.leftMargin = dp(10);
-        row.addView(importButton, right);
+        final String directory = workspaceDirectory;
+        LinearLayout header = vertical();
+        header.setPadding(dp(12), dp(10), dp(12), dp(8));
+        header.addView(text("Рабочая папка", 18, WHITE, true));
+        LinearLayout pathRow = new LinearLayout(this);
+        pathRow.setGravity(Gravity.CENTER_VERTICAL);
+        if (!directory.isEmpty()) {
+            Button up = button("←", false);
+            up.setContentDescription("На уровень выше");
+            LinearLayout.LayoutParams upSize = new LinearLayout.LayoutParams(dp(44), dp(44));
+            upSize.rightMargin = dp(8);
+            pathRow.addView(up, upSize);
+            up.setOnClickListener(v -> openWorkspaceDirectory(parentDirectory(directory)));
+        }
+        TextView path = text("/" + directory, 13, MUTED, false);
+        path.setMaxLines(2);
+        path.setEllipsize(TextUtils.TruncateAt.END);
+        path.setTextIsSelectable(true);
+        LinearLayout folder = vertical();
+        folder.setGravity(Gravity.CENTER_VERTICAL);
+        folder.setMinimumHeight(dp(44));
+        folder.addView(path);
+        TextView summary = text("", 11, MUTED, false);
+        folder.addView(summary);
+        pathRow.addView(folder, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        header.addView(pathRow);
+        LinearLayout actions = new LinearLayout(this);
+        Button create = button("+ Новый файл", false);
+        Button importButton = button("Импорт", false);
+        workspaceExportButton = button("Экспорт ZIP", true);
+        addWorkspaceAction(actions, create);
+        addWorkspaceAction(actions, importButton);
+        addWorkspaceAction(actions, workspaceExportButton);
+        header.addView(actions);
+        workspaceExportStatus = text("", 12, GOLD, false);
+        padded(header, workspaceExportStatus, 5);
+        updateWorkspaceExportControls();
         create.setOnClickListener(v -> createFile());
         importButton.setOnClickListener(v -> importFile());
-        padded(content, row, 20);
-        try {
-            List<String> paths = workspace.filePaths();
-            if (paths.isEmpty()) padded(content, text("Пока нет файлов", 14, MUTED, false), 17);
-            for (String path : paths) {
-                Button f = button("📄  " + path, false);
-                f.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-                f.setOnClickListener(v -> editFile(path));
-                padded(content, f, 8);
+        workspaceExportButton.setOnClickListener(v -> workspaceExport.prepare(directory));
+        mainArea.addView(header);
+
+        TextView empty = text("Загрузка…", 13, MUTED, false);
+        empty.setPadding(dp(12), dp(8), dp(12), dp(12));
+        mainArea.addView(empty);
+        ListView list = new ListView(this);
+        workspaceList = list;
+        list.setDivider(new ColorDrawable(Color.TRANSPARENT));
+        list.setSelector(new ColorDrawable(Color.argb(40, 255, 78, 103)));
+        list.setDrawSelectorOnTop(true);
+        list.setDividerHeight(dp(5));
+        list.setPadding(dp(12), 0, dp(12), dp(12));
+        mainArea.addView(list, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        list.setEmptyView(empty);
+        workspaceDirectoryTask = workspaceBrowserExecutor.submit(() -> {
+            try {
+                List<WorkspaceZipExporter.Entry> entries = workspaceZipExporter.listDirectory(directory);
+                runOnUiThread(() -> {
+                    if (workspaceList != list || isDestroyed()) return;
+                    empty.setText("В папке нет доступных файлов");
+                    list.setAdapter(new WorkspaceFileAdapter(entries));
+                    list.setOnItemClickListener((parent, view, position, id) -> {
+                        WorkspaceZipExporter.Entry entry = entries.get(position);
+                        if (entry.directory) openWorkspaceDirectory(entry.relativePath);
+                        else previewWorkspaceFile(list, entry);
+                    });
+                });
+            } catch (IOException | RuntimeException e) {
+                runOnUiThread(() -> {
+                    if (workspaceList != list || isDestroyed()) return;
+                    empty.setText(workspaceBrowserError("Не удалось открыть папку.", e));
+                });
+                return;
             }
-        } catch (Exception e) {
-            padded(content, text(e.getMessage(), 14, GOLD, false), 10);
+            showWorkspaceDirectorySize(directory, list, summary);
+        });
+    }
+
+    private void showWorkspaceDirectorySize(String directory, ListView list, TextView summary) {
+        try {
+            long size = workspaceZipExporter.directorySize(directory);
+            runOnUiThread(() -> {
+                if (workspaceList == list && !isDestroyed()) {
+                    summary.setText("Размер содержимого: " + fileSize(size));
+                }
+            });
+        } catch (IOException | RuntimeException e) {
+            runOnUiThread(() -> {
+                if (workspaceList == list && !isDestroyed()) summary.setText("Размер содержимого недоступен");
+            });
         }
     }
 
+    private void addWorkspaceAction(LinearLayout row, Button action) {
+        action.setMinimumWidth(0);
+        action.setMinWidth(0);
+        action.setPadding(dp(3), dp(4), dp(3), dp(4));
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, dp(48), 1);
+        if (row.getChildCount() > 0) size.leftMargin = dp(6);
+        row.addView(action, size);
+    }
+
+    private void openWorkspaceDirectory(String directory) {
+        workspaceDirectory = directory;
+        draw();
+    }
+
+    private static String parentDirectory(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash < 0 ? "" : path.substring(0, slash);
+    }
+
+    private final class WorkspaceFileAdapter extends BaseAdapter {
+        private final List<WorkspaceZipExporter.Entry> entries;
+
+        WorkspaceFileAdapter(List<WorkspaceZipExporter.Entry> entries) { this.entries = entries; }
+        @Override public int getCount() { return entries.size(); }
+        @Override public WorkspaceZipExporter.Entry getItem(int position) { return entries.get(position); }
+        @Override public long getItemId(int position) { return position; }
+
+        @Override public View getView(int position, View reusable, ViewGroup parent) {
+            LinearLayout row;
+            if (reusable == null) {
+                row = vertical();
+                row.setPadding(dp(10), dp(6), dp(10), dp(6));
+                row.setMinimumHeight(dp(48));
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setBackground(shape(PANEL, 3));
+                row.addView(text("", 13, WHITE, true));
+                row.addView(text("", 11, MUTED, false));
+            } else {
+                row = (LinearLayout) reusable;
+            }
+            WorkspaceZipExporter.Entry entry = getItem(position);
+            ((TextView) row.getChildAt(0)).setText((entry.directory ? "▸  " : "") + entry.name);
+            ((TextView) row.getChildAt(1)).setText(entry.directory ? "Папка" : fileSize(entry.bytes));
+            return row;
+        }
+    }
+
+    private String fileSize(long bytes) {
+        return Formatter.formatFileSize(this, bytes);
+    }
+
+    private void previewWorkspaceFile(ListView list, WorkspaceZipExporter.Entry entry) {
+        if (!list.isEnabled()) return;
+        list.setEnabled(false);
+        workspaceBrowserExecutor.execute(() -> {
+            try {
+                byte[] bytes = workspaceZipExporter.readPreview(entry.relativePath);
+                String content = new String(bytes, StandardCharsets.UTF_8);
+                if (content.indexOf('\0') >= 0 || !Arrays.equals(bytes, content.getBytes(StandardCharsets.UTF_8))) {
+                    throw new IOException("Предпросмотр доступен для текста в UTF-8.");
+                }
+                runOnUiThread(() -> {
+                    if (!finishWorkspacePreview(list)) return;
+                    editFile(entry.relativePath, content);
+                });
+            } catch (IOException | RuntimeException e) {
+                runOnUiThread(() -> {
+                    if (!finishWorkspacePreview(list)) return;
+                    new AlertDialog.Builder(this).setTitle(entry.name)
+                            .setMessage(fileSize(entry.bytes) + "\n\n"
+                                    + workspaceBrowserError("Предпросмотр недоступен.", e))
+                            .setPositiveButton("Закрыть", null).show();
+                });
+            }
+        });
+    }
+
+    private boolean finishWorkspacePreview(ListView list) {
+        if (workspaceList != list || isFinishing() || isDestroyed()) return false;
+        list.setEnabled(true);
+        return resumed;
+    }
+
+    private static String workspaceBrowserError(String fallback, Exception e) {
+        String detail = e.getMessage();
+        return detail == null || detail.isEmpty() ? fallback : fallback + "\n" + detail;
+    }
+
+    private void updateWorkspaceExportControls() {
+        if (workspaceExportButton == null || workspaceExport == null) return;
+        WorkspaceExportSession.Phase phase = workspaceExport.phase();
+        boolean busy = phase != WorkspaceExportSession.Phase.IDLE;
+        workspaceExportButton.setEnabled(!busy);
+        workspaceExportButton.setAlpha(busy ? 0.55f : 1f);
+        workspaceExportStatus.setVisibility(busy ? View.VISIBLE : View.GONE);
+        workspaceExportStatus.setText(switch (phase) {
+            case PREPARING -> "Подготовка и проверка ZIP…";
+            case READY, PICKER_OPEN -> "Выберите место сохранения…";
+            case SAVING -> "Сохранение и проверка ZIP…";
+            case IDLE -> "";
+        });
+    }
+
+    private void onWorkspaceExportChanged() {
+        updateWorkspaceExportControls();
+        if (workspaceExport == null || !resumed || isFinishing() || isDestroyed()) return;
+        if (workspaceExport.phase() == WorkspaceExportSession.Phase.READY) {
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("application/zip");
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            intent.putExtra(Intent.EXTRA_TITLE, workspaceExport.openPicker());
+            try {
+                startActivityForResult(intent, REQ_WORKSPACE_EXPORT);
+            } catch (android.content.ActivityNotFoundException | SecurityException e) {
+                workspaceExport.cancelPicker("Не удалось открыть системное окно сохранения.");
+            }
+            return;
+        }
+        WorkspaceExportSession.Result result = workspaceExport.result();
+        if (result != null && (workspaceExportDialog == null || !workspaceExportDialog.isShowing())) {
+            showWorkspaceExportResult(result);
+        }
+    }
+
+    private void showWorkspaceExportResult(WorkspaceExportSession.Result result) {
+        WorkspaceZipExporter.Archive archive = result.archive;
+        String title = archive == null ? "Ошибка экспорта ZIP" : "ZIP сохранён и проверен";
+        String message = result.message;
+        if (archive != null) {
+            String file = message == null || message.isEmpty() ? "" : message + "\n\n";
+            message = file + "Файлы: " + archive.fileCount + " из " + archive.availableFileCount
+                    + " доступных\nРазмер: " + fileSize(archive.bytes) + " (" + archive.bytes + " байт)"
+                    + "\n\nSHA-256\n" + archive.sha256
+                    + "\n\nСекреты, служебные данные и символические ссылки пропускаются.";
+        }
+        ScrollView scroll = new ScrollView(this);
+        TextView body = text(message, 13, WHITE, false);
+        body.setTextIsSelectable(true);
+        body.setPadding(dp(20), dp(10), dp(20), dp(10));
+        scroll.addView(body);
+        workspaceExportDialog = new AlertDialog.Builder(this).setTitle(title).setView(scroll)
+                .setPositiveButton("Закрыть", (d, w) -> workspaceExport.clearResult())
+                .setOnCancelListener(d -> workspaceExport.clearResult()).show();
+        workspaceExportDialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(BLUE);
+    }
+
     private void createFile() {
-        EditText name = field("Например: src/main.py", "");
+        EditText name = field("Например: src/main.py", workspaceDirectory.isEmpty() ? "" : workspaceDirectory + "/");
+        name.setSelection(name.length());
         new AlertDialog.Builder(this).setTitle("Новый файл")
                 .setView(name).setPositiveButton("Создать", (d, w) -> {
                     String path = name.getText().toString().trim();
                     try {
                         if (workspace.resolve(path).exists()) throw new IOException("Файл уже существует");
                         workspace.write(path, "");
-                        draw(); editFile(path);
+                        draw(); editFile(path, "");
                     } catch (Exception e) { toast(e.getMessage()); }
                 }).setNegativeButton("Отмена", null).show();
     }
 
-    private void editFile(String path) {
-        try {
-            String content = workspace.read(path);
-            EditText editor = field("Содержимое", content);
-            editor.setTypeface(Typeface.MONOSPACE);
-            editor.setMinLines(9);
-            editor.setMaxLines(24);
-            ScrollView scroll = new ScrollView(this);
-            scroll.addView(editor);
-            AlertDialog dialog = new AlertDialog.Builder(this)
-                    .setTitle("📝 " + path)
-                    .setView(scroll)
-                    .setPositiveButton("Сохранить", (d, w) -> {
-                        try { workspace.write(path, editor.getText().toString()); toast("Сохранено: " + path); }
-                        catch (Exception e) { toast(e.getMessage()); }
-                    })
-                    .setNeutralButton("Удалить", (d, w) -> {
-                        new AlertDialog.Builder(this).setTitle("Точно удалить " + path + "?")
-                                .setPositiveButton("Удалить", (dd, ww) -> {
-                                    try { workspace.delete(path); draw(); }
-                                    catch (Exception e) { toast(e.getMessage()); }
-                                }).setNegativeButton("Отмена", null).show();
-                    })
-                    .setNegativeButton("Закрыть", null).create();
-            dialog.show();
-        } catch (Exception e) { toast(e.getMessage()); }
+    private void editFile(String path, String content) {
+        EditText editor = field("Содержимое", content);
+        editor.setMinLines(9);
+        editor.setMaxLines(24);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(editor);
+        new AlertDialog.Builder(this).setTitle("📝 " + path).setView(scroll)
+                .setPositiveButton("Сохранить", (d, w) -> {
+                    try {
+                        workspaceZipExporter.requireFile(path);
+                        workspace.write(path, editor.getText().toString());
+                        toast("Сохранено: " + path);
+                        draw();
+                    } catch (Exception e) { toast(e.getMessage()); }
+                })
+                .setNeutralButton("Удалить", (d, w) -> {
+                    new AlertDialog.Builder(this).setTitle("Точно удалить " + path + "?")
+                            .setPositiveButton("Удалить", (dd, ww) -> {
+                                try {
+                                    workspaceZipExporter.requireFile(path);
+                                    workspace.delete(path);
+                                    draw();
+                                } catch (Exception e) { toast(e.getMessage()); }
+                            }).setNegativeButton("Отмена", null).show();
+                })
+                .setNegativeButton("Закрыть", null).show();
     }
 
     private void importFile() {
@@ -686,6 +953,13 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_WORKSPACE_EXPORT && workspaceExport != null) {
+            if (resultCode != RESULT_OK) workspaceExport.cancelPicker(null);
+            else if (data == null || data.getData() == null) {
+                workspaceExport.cancelPicker("Система не вернула выбранный документ.");
+            } else workspaceExport.saveTo(data.getData());
+            return;
+        }
         if (requestCode == REQ_JOURNAL_EXPORT) {
             if (resultCode == RESULT_OK && data != null && data.getData() != null)
                 saveJournalTo(data.getData());
@@ -725,7 +999,7 @@ public final class MainActivity extends Activity {
             while (workspace.resolve(path).exists()) path = "imports/" + suffix++ + "_" + name;
             workspace.write(path, body);
             toast("Импортировано: " + path);
-            if (tab == 1) draw();
+            if (tab == 1) openWorkspaceDirectory("imports");
         } catch (Exception e) { toast("Импорт: " + e.getMessage()); }
     }
 
@@ -1225,6 +1499,12 @@ public final class MainActivity extends Activity {
         stopRequested.set(true);
         executor.shutdownNow();
         creditExecutor.shutdownNow();
+        workspaceBrowserExecutor.shutdownNow();
+        if (workspaceExportDialog != null) workspaceExportDialog.dismiss();
+        if (workspaceExport != null) {
+            workspaceExport.listen(null);
+            if (!isChangingConfigurations()) workspaceExport.close();
+        }
         super.onDestroy();
     }
 }
