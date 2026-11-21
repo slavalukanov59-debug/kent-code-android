@@ -627,7 +627,7 @@ public final class MainActivity extends Activity {
     }
 
     private boolean taskRunning() {
-        return running || missionStore.active() != null;
+        return running || missionStore.hasActive();
     }
 
     private String activeKey() throws Exception {
@@ -1695,19 +1695,26 @@ public final class MainActivity extends Activity {
         if (taskRunning()) { toast("Приостановите текущую задачу перед созданием копии."); return; }
         running = true;
         executor.submit(() -> {
+            boolean created = false;
             try {
                 String id = LabWorkspace.create(getApplicationContext());
                 missionStore.create(SensitiveData.redact(goal), secrets.provider(), secrets.model(), id);
-                runOnUiThread(() -> {
-                    if (isDestroyed()) return;
+                created = true;
+            } catch (IOException | RuntimeException e) {
+                // Show the failure on the UI thread when setup has finished.
+            }
+            boolean finished = created;
+            runOnUiThread(() -> {
+                running = false;
+                if (isDestroyed()) return;
+                if (finished) {
                     tab = 4;
                     draw();
-                });
-            } catch (Exception e) {
-                runOnUiThread(() -> toast("Не удалось создать копию KENT LAB."));
-            } finally {
-                runOnUiThread(() -> running = false);
-            }
+                } else {
+                    toast("Не удалось создать копию KENT LAB.");
+                    updateChatRunningState();
+                }
+            });
         });
     }
 

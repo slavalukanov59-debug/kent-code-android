@@ -17,16 +17,16 @@ jobs:
       apk_artifact_id: ${{ steps.apk_artifact.outputs.artifact-id }}
     steps:
       - name: Checkout
-        uses: &checkout_action actions/checkout@v4
+        uses: &checkout_action actions/checkout@v7
         with: &checkout_inputs
           persist-credentials: false
       - name: JDK 17
-        uses: &java_action actions/setup-java@v4
+        uses: &java_action actions/setup-java@v6
         with: &java_inputs
           distribution: temurin
           java-version: '17'
       - name: Gradle 8.13
-        uses: &gradle_action gradle/actions/setup-gradle@v4
+        uses: &gradle_action gradle/actions/setup-gradle@v6
         with: &gradle_inputs
           gradle-version: '8.13'
       - name: Test file workspace

@@ -482,6 +482,8 @@ public final class MissionStore {
 
     public synchronized Mission active() { return find(activeId); }
 
+    public synchronized boolean hasActive() { return !activeId.isEmpty(); }
+
     private int indexOf(String id) {
         for (int i = 0; i < missions.size(); i++) if (missions.get(i).id.equals(id)) return i;
         return -1;
