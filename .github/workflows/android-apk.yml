@@ -35,14 +35,17 @@ jobs:
           javac -d /tmp/kent-tests \
             app/src/main/java/ai/kent/code/SafeWorkspace.java \
             app/src/main/java/ai/kent/code/CommandResult.java \
+            app/src/main/java/ai/kent/code/WorkspaceZipExporter.java \
             app/src/main/java/ai/kent/code/ShellRunner.java \
             tests/WorkspaceSmokeTest.java \
+            tests/WorkspaceZipExporterSmokeTest.java \
             tests/ShellRunnerSmokeTest.java \
             app/src/main/java/ai/kent/code/ApiKeyValidator.java \
             tests/ApiKeyValidatorSmokeTest.java \
             app/src/main/java/ai/kent/code/ApiRetryPolicy.java \
             tests/ApiRetryPolicySmokeTest.java
           java -cp /tmp/kent-tests ai.kent.code.WorkspaceSmokeTest
+          java -cp /tmp/kent-tests ai.kent.code.WorkspaceZipExporterSmokeTest
           java -cp /tmp/kent-tests ai.kent.code.ShellRunnerSmokeTest
           java -cp /tmp/kent-tests ai.kent.code.ApiKeyValidatorSmokeTest
           java -cp /tmp/kent-tests ai.kent.code.ApiRetryPolicySmokeTest
@@ -80,7 +83,10 @@ jobs:
       - name: Upload APK to this GitHub Actions run
         id: apk_artifact
         uses: actions/upload-artifact@v7
-        continue-on-error: ${{ github.ref == 'refs/heads/main' }}
+        continue-on-error: >-
+          ${{ github.ref == 'refs/heads/main' ||
+              github.ref == 'refs/heads/feature/kent-0.7-zip-export' ||
+              github.head_ref == 'feature/kent-0.7-zip-export' }}
         with:
           name: KENT-CODE-debug-${{ github.run_number }}
           path: |
@@ -91,8 +97,10 @@ jobs:
           retention-days: 14
 
   publish:
-    # Preserve the existing main prereleases, even when the Actions artifact quota is exhausted.
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # Publish main builds and manually requested ZIP export previews.
+    if: >-
+      (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') ||
+      (github.ref == 'refs/heads/feature/kent-0.7-zip-export' && github.event_name == 'workflow_dispatch')
     needs: build
     permissions:
       contents: write
