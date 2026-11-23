@@ -428,8 +428,9 @@ public final class GitHubClient {
     Result readSource(String repository, String ref, String path, int offset, int limit, String apiKey) throws Exception {
         checkSlice(offset, limit);
         String repo = repository(repository);
-        String selected = refOrDefault(repo, ref);
         String relative = filePath(path, false);
+        requireAgentSource(relative);
+        String selected = refOrDefault(repo, ref);
         JSONObject commit = commit(repo, selected);
         String head = objectId(commit, "sha");
         String root = objectId(commit.getJSONObject("commit").getJSONObject("tree"), "sha");
@@ -522,12 +523,14 @@ public final class GitHubClient {
             return new Result("Diff · " + repo, overview + "Файлы не изменились.", url);
         if (fileOffset >= files.length()) throw new IllegalArgumentException("Смещение файла выходит за список diff.");
         JSONObject file = files.getJSONObject(fileOffset);
-        String path = visible(file.getString("filename"));
+        String filename = file.getString("filename");
+        String path = visible(filename);
         String earlier = file.optString("previous_filename");
         String change = visible(file.optString("status")) + " · " + path
                 + (earlier.isEmpty() ? "" : " ← " + visible(earlier))
                 + " · +" + file.optInt("additions") + " −" + file.optInt("deletions");
-        String patch = redactSource(file.optString("patch"), apiKey);
+        boolean credentials = credentialPath(filename) || credentialPath(earlier);
+        String patch = credentials ? "" : redactSource(file.optString("patch"), apiKey);
         int start = Math.min(patchOffset, patch.length());
         if (start > 0 && start < patch.length() && Character.isLowSurrogate(patch.charAt(start))) start--;
         int end = Math.min(start + 4_000, patch.length());
@@ -535,8 +538,9 @@ public final class GitHubClient {
         String header = "file_offset=" + fileOffset + " next_file_offset="
                 + (fileOffset + 1 < files.length() ? fileOffset + 1 : "none")
                 + " patch_offset=" + start + " next_patch_offset=" + (end < patch.length() ? end : "none");
-        return new Result("Diff · " + repo, header + "\n" + overview + change + "\n"
-                + (patch.isEmpty() ? "GitHub не вернул текст diff этого файла." : visible(patch.substring(start, end))), url);
+        String detail = credentials ? "Содержимое файла учётных данных скрыто."
+                : patch.isEmpty() ? "GitHub не вернул текст diff этого файла." : visible(patch.substring(start, end));
+        return new Result("Diff · " + repo, header + "\n" + overview + change + "\n" + detail, url);
     }
 
     private String redactSource(String source, String apiKey) {
@@ -703,11 +707,11 @@ public final class GitHubClient {
         String target = branch(targetBranch);
         String title = headline(message);
         rejectCredential(title);
-        requireWorkingBranch(repo, target);
         if (edits.isEmpty()) throw new IllegalArgumentException("Укажите файлы для коммита.");
         Set<String> paths = new HashSet<>();
         for (FileEdit edit : edits) {
             filePath(edit.path, false);
+            requireAgentSource(edit.path);
             rejectCredential(edit.path);
             if (!paths.add(edit.path)) throw new IllegalArgumentException("Путь повторяется: " + edit.path);
         }
@@ -717,6 +721,7 @@ public final class GitHubClient {
                     throw new IllegalArgumentException("Изменения должны относиться к отдельным файлам: " + path);
             }
         }
+        requireWorkingBranch(repo, target);
         String head = branchHead(repo, target);
         String root = commitTree(repo, head);
         Map<String, JSONArray> cache = new HashMap<>();
@@ -876,13 +881,17 @@ public final class GitHubClient {
         for (int i = 0; i < files.length() && text.length() < MAX_PREVIEW_CHARS; i++) {
             JSONObject file = files.optJSONObject(i);
             if (file == null) continue;
-            text.append("\n").append(visible(file.optString("filename")))
+            String filename = file.optString("filename");
+            text.append("\n").append(visible(filename))
                     .append("  +").append(file.optInt("additions"))
                     .append("  −").append(file.optInt("deletions"));
             String earlier = file.optString("previous_filename");
             if (!earlier.isEmpty()) text.append("  ← ").append(visible(earlier));
             text.append('\n');
-            text.append(visible(file.optString("patch", "Текст diff недоступен."))).append('\n');
+            String patch = credentialPath(filename) || credentialPath(earlier)
+                    ? "Содержимое файла учётных данных скрыто."
+                    : visible(file.optString("patch", "Текст diff недоступен."));
+            text.append(patch).append('\n');
         }
         return limited(text);
     }
@@ -1090,6 +1099,17 @@ public final class GitHubClient {
                 throw new IllegalArgumentException("Укажите относительный путь внутри репозитория.");
         }
         return path;
+    }
+
+    private static void requireAgentSource(String path) throws IOException {
+        if (credentialPath(path)) throw new IOException("Файлы учётных данных недоступны агенту.");
+    }
+
+    private static boolean credentialPath(String path) {
+        for (String component : path.toLowerCase(Locale.ROOT).split("/")) {
+            if (SafeWorkspace.isCredentialName(component)) return true;
+        }
+        return false;
     }
 
     private static String objectId(JSONObject object, String field) throws Exception {

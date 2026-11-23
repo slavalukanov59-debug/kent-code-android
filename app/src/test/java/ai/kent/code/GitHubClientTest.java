@@ -259,6 +259,23 @@ public final class GitHubClientTest {
         script.done();
     }
 
+    @Test public void keepsCredentialFilesOutOfAgentReadsChangesAndDiffs() throws Exception {
+        Script script = new Script(TOKEN);
+        GitHubClient client = script.client();
+        assertThrows(IOException.class, () -> client.readSource(REPO, HEAD, "app/.ENV.local", 0, 100, ""));
+        assertThrows(IOException.class, () -> client.prepareCommit(REPO, "topic", "Edit settings",
+                List.of(new GitHubClient.FileEdit("settings/credentials.json", "{}", ""))));
+        script.done();
+        script.response("GET", ROOT + "/compare/" + BASE + "..." + HEAD,
+                new JSONObject().put("ahead_by", 1).put("files", new JSONArray().put(new JSONObject()
+                        .put("filename", "settings.txt").put("previous_filename", "app/.env")
+                        .put("status", "renamed").put("patch", "-TOKEN=private-short-value"))));
+        String diff = client.diff(REPO, BASE, HEAD, 0, 0, "").text;
+        assertTrue(diff.contains("Содержимое файла учётных данных скрыто."));
+        assertFalse(diff.contains("private-short-value"));
+        script.done();
+    }
+
     @Test public void agentDiffAndWorkflowExposeActualRowsAtExactOffsets() throws Exception {
         Script script = new Script("");
         GitHubClient client = script.client();
