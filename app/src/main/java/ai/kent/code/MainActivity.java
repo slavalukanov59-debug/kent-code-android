@@ -40,6 +40,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.InputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -79,13 +80,19 @@ public final class MainActivity extends Activity {
     private WorkspaceZipExporter workspaceZipExporter;
     private WorkspaceExportSession workspaceExport;
     private String workspaceDirectory = "";
+    private int workspacePosition;
+    private int workspaceOffset;
     private ListView workspaceList;
     private Future<?> workspaceDirectoryTask;
     private Button workspaceExportButton;
+    private Button offeredProjectExport;
     private TextView workspaceExportStatus;
     private AlertDialog workspaceExportDialog;
     private boolean resumed;
     private SecureKeyStore secrets;
+    private ProjectService projects;
+    private DiagnosticsStore diagnostics;
+    private TerminalTools terminal;
     private volatile KentAgent activeAgent;
     private volatile String stopStatus = MissionStore.PAUSED;
     private volatile boolean foreground;
@@ -104,6 +111,7 @@ public final class MainActivity extends Activity {
     private static final int REQ_MISSION_EXPORT = 743;
     private static final int REQ_MEMORY_EXPORT = 744;
     private static final int REQ_WORKSPACE_EXPORT = 745;
+    private static final int REQ_PROJECTS = 746;
     private TextView creditLabel;
     private String creditText = CreditBalance.UNKNOWN_LABEL;
     private int creditGeneration;
@@ -123,6 +131,8 @@ public final class MainActivity extends Activity {
     private final Set<String> expandedMissions = new HashSet<>();
     private ScrollView missionScroll;
     private ScrollView actionScroll;
+    private int missionScrollY;
+    private int actionScrollY;
     private String actionMissionId = "";
     private int actionPanel;
     private String chatDraft = "";
@@ -134,6 +144,8 @@ public final class MainActivity extends Activity {
     private int tab = 0;
     private volatile boolean running = false;
     private final List<ChatTimeline.Message> messages = new ArrayList<>();
+
+    private record RetainedState(WorkspaceExportSession export, String draft, int cursor) {}
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -151,6 +163,9 @@ public final class MainActivity extends Activity {
             journal = data.chat;
             tokenMeter = data.tokens;
             missionStore = data.missions;
+            projects = data.projects;
+            diagnostics = data.diagnostics;
+            terminal = data.terminal;
             workspaceZipExporter = new WorkspaceZipExporter(workspace);
             bridge = new TermuxBridge(this);
             localBridge = new LocalTermuxBridge(secrets);
@@ -159,7 +174,12 @@ public final class MainActivity extends Activity {
                     .setMessage(e.getMessage()).setPositiveButton("Закрыть", (d, w) -> finish()).show();
             return;
         }
-        workspaceExport = (WorkspaceExportSession) getLastNonConfigurationInstance();
+        RetainedState retained = (RetainedState) getLastNonConfigurationInstance();
+        if (retained != null) {
+            workspaceExport = retained.export;
+            chatDraft = retained.draft;
+            draftCursor = retained.cursor;
+        }
         if (workspaceExport == null) {
             workspaceExport = new WorkspaceExportSession(getApplicationContext(), workspaceZipExporter, secrets, state);
         }
@@ -170,6 +190,8 @@ public final class MainActivity extends Activity {
             pendingMissionExportId = state.getString("missionExport", "");
             lastBridgeResult = state.getString("bridgeResult", lastBridgeResult);
             workspaceDirectory = state.getString("workspace_directory", "");
+            workspacePosition = state.getInt("workspace_position");
+            workspaceOffset = state.getInt("workspace_offset");
         }
         restoreChatUiState(state);
         draw();
@@ -193,9 +215,15 @@ public final class MainActivity extends Activity {
 
     @Override protected void onSaveInstanceState(Bundle state) {
         saveChatUiState(state);
+        rememberWorkspacePosition();
+        rememberPanelPositions();
         state.putString("missionExport", pendingMissionExportId);
         state.putString("bridgeResult", lastBridgeResult);
         state.putString("workspace_directory", workspaceDirectory);
+        state.putInt("workspace_position", workspacePosition);
+        state.putInt("workspace_offset", workspaceOffset);
+        state.putInt("mission_scroll", missionScrollY);
+        state.putInt("action_scroll", actionScrollY);
         if (workspaceExport != null) workspaceExport.saveState(state);
         super.onSaveInstanceState(state);
     }
@@ -211,7 +239,10 @@ public final class MainActivity extends Activity {
         super.onPause();
     }
 
-    @Override public Object onRetainNonConfigurationInstance() { return workspaceExport; }
+    @Override public Object onRetainNonConfigurationInstance() {
+        rememberChat();
+        return new RetainedState(workspaceExport, chatDraft, draftCursor);
+    }
 
     private int dp(int x) { return (int)(x * getResources().getDisplayMetrics().density + .5f); }
 
@@ -279,16 +310,17 @@ public final class MainActivity extends Activity {
     }
 
     private void draw() {
+        rememberWorkspacePosition();
+        rememberPanelPositions();
         if (workspaceDirectoryTask != null) {
             workspaceDirectoryTask.cancel(true);
             workspaceDirectoryTask = null;
         }
         workspaceList = null;
         workspaceExportButton = null;
+        offeredProjectExport = null;
         workspaceExportStatus = null;
         rememberChat();
-        int missionScrollY = missionScroll == null ? 0 : missionScroll.getScrollY();
-        int actionScrollY = actionScroll == null ? 0 : actionScroll.getScrollY();
         if (tab != 0 && composer != null && composer.hasFocus()) {
             InputMethodManager input = getSystemService(InputMethodManager.class);
             if (input != null) input.hideSoftInputFromWindow(composer.getWindowToken(), 0);
@@ -359,7 +391,7 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams markSpace = new LinearLayout.LayoutParams(dp(7), dp(7));
         markSpace.rightMargin = dp(8);
         head.addView(mark, markSpace);
-        TextView title = text("KENT CODE 0.7", 16, WHITE, true);
+        TextView title = text("KENT CODE 0.8", 16, WHITE, true);
         title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         head.addView(title, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1));
@@ -408,6 +440,18 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void rememberWorkspacePosition() {
+        if (workspaceList != null && workspaceList.getChildCount() > 0) {
+            workspacePosition = workspaceList.getFirstVisiblePosition();
+            workspaceOffset = workspaceList.getChildAt(0).getTop() - workspaceList.getPaddingTop();
+        }
+    }
+
+    private void rememberPanelPositions() {
+        if (missionScroll != null) missionScrollY = missionScroll.getScrollY();
+        if (actionScroll != null) actionScrollY = actionScroll.getScrollY();
+    }
+
     private void saveChatUiState(Bundle state) {
         rememberChat();
         state.putBundle("chat.anchor", chatAnchor.asBundle());
@@ -425,6 +469,8 @@ public final class MainActivity extends Activity {
         tab = state.getInt("active.tab", 0);
         actionPanel = state.getInt("actions.panel", 0);
         actionMissionId = state.getString("actions.mission", "");
+        missionScrollY = state.getInt("mission_scroll");
+        actionScrollY = state.getInt("action_scroll");
     }
 
     private void drawChat() {
@@ -479,6 +525,27 @@ public final class MainActivity extends Activity {
         updateChatRunningState();
         requestCredits(false);
 
+        LinearLayout development = new LinearLayout(this);
+        development.setPadding(dp(10), 0, dp(10), dp(4));
+        boolean developer = secrets.developerMode();
+        addControl(development, developer ? "DEVELOPER MODE" : "Режим разработчика", developer, () -> {
+            if (taskRunning()) { toast("Сначала приостановите текущую задачу."); return; }
+            secrets.developerMode(!secrets.developerMode());
+            draw();
+        });
+        String selectedProject = secrets.developerProject();
+        addControl(development, developer && !selectedProject.isEmpty() ? selectedProject : "Проекты",
+                false, this::openProjects);
+        Button projectButton = (Button) development.getChildAt(development.getChildCount() - 1);
+        projectButton.setSingleLine(true);
+        projectButton.setEllipsize(TextUtils.TruncateAt.START);
+        projectButton.setContentDescription(selectedProject.isEmpty() ? "Проекты" : "Проекты · " + selectedProject);
+        mainArea.addView(development);
+
+        offeredProjectExport = actionButton("Сохранить подготовленный ZIP", workspaceExport::chooseOffered);
+        offeredProjectExport.setVisibility(workspaceExport.isOffered() ? View.VISIBLE : View.GONE);
+        mainArea.addView(offeredProjectExport);
+
         timeline = new ChatTimeline(this, expandedChat);
         mainArea.addView(timeline, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
@@ -517,6 +584,7 @@ public final class MainActivity extends Activity {
         MissionStore.Mission active = missionStore.active();
         MissionStore.Mission shown = active == null ? missionStore.selected() : active;
         String state = shown == null ? "Готов к задачам" : shown.status;
+        if (active != null && active.developerMode && !active.phase.isEmpty()) state = active.phase;
         int color = shown == null ? GREEN : missionColor(shown.status);
         if (running && active == null) {
             state = "Выполняется команда Termux";
@@ -709,7 +777,9 @@ public final class MainActivity extends Activity {
             return;
         }
         try {
-            MissionStore.Mission mission = missionStore.begin(prompt, secrets.provider(), secrets.model());
+            boolean developer = secrets.developerMode();
+            MissionStore.Mission mission = missionStore.begin(prompt, secrets.provider(), secrets.model(), "",
+                    developer, developer ? secrets.developerProject() : "");
             composer.setText("");
             addMessage("ТЫ", prompt);
             launchMission(mission, prompt, key);
@@ -737,6 +807,33 @@ public final class MainActivity extends Activity {
                 return foreground && !stopRequested.get() && requestApproval(title, detail);
             }
 
+            @Override public boolean offerProjectExport(WorkspaceZipExporter.Archive prepared) {
+                CountDownLatch completed = new CountDownLatch(1);
+                final class Offer {
+                    boolean closed;
+                    boolean accepted;
+                }
+                Offer offer = new Offer();
+                runOnUiThread(() -> {
+                    synchronized (offer) {
+                        if (!offer.closed && foreground && !isDestroyed() && !stopRequested.get()) {
+                            offer.accepted = workspaceExport.offer(prepared);
+                        }
+                        offer.closed = true;
+                    }
+                    completed.countDown();
+                });
+                try {
+                    completed.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                synchronized (offer) {
+                    offer.closed = true;
+                    return offer.accepted;
+                }
+            }
+
             @Override public boolean cancelled() { return stopRequested.get(); }
             @Override public String stopStatus() { return stopStatus; }
 
@@ -748,7 +845,9 @@ public final class MainActivity extends Activity {
 
             @Override public void missionChanged() {
                 runOnUiThread(() -> {
-                    if (missionRefreshQueued || isDestroyed() || (tab != 4 && tab != 2)) return;
+                    if (isDestroyed()) return;
+                    if (tab == 0) updateChatRunningState();
+                    if (missionRefreshQueued || (tab != 4 && tab != 2)) return;
                     missionRefreshQueued = true;
                     mainHandler.postDelayed(() -> {
                         missionRefreshQueued = false;
@@ -769,8 +868,14 @@ public final class MainActivity extends Activity {
             toast(e.getMessage());
             return;
         }
-        KentAgent agent = new KentAgent(selected, tokenMeter, missionStore, agentEvents());
-        boolean autoWrite = mission.workspaceId.isEmpty() && mission.attempts == 1 && secrets.autopilotEnabled();
+        KentAgent.Events events = agentEvents();
+        ToolDispatcher tools = mission.developerMode
+                ? new ToolDispatcher(projects, terminal, missionStore, events, mission.id,
+                        () -> new GitHubClient(secrets.loadGitHubToken()), new File(getCacheDir(), "workspace-zip"),
+                        secrets::exportSecrets) : null;
+        KentAgent agent = new KentAgent(selected, tokenMeter, missionStore, events, tools);
+        boolean autoWrite = !mission.developerMode && mission.workspaceId.isEmpty()
+                && mission.attempts == 1 && secrets.autopilotEnabled();
         activeAgent = agent;
         running = true;
         stopStatus = MissionStore.PAUSED;
@@ -779,10 +884,15 @@ public final class MainActivity extends Activity {
         executor.submit(() -> {
             try { agent.task(mission, prompt, autoWrite, key); }
             finally {
+                MissionStore.Mission completed = mission.developerMode ? missionStore.find(mission.id) : null;
                 runOnUiThread(() -> {
                     running = false;
                     activeAgent = null;
                     if (isDestroyed()) return;
+                    if (completed != null && !mission.projectId.equals(completed.projectId)) {
+                        secrets.developerProject(completed.projectId);
+                        if (tab == 0) draw();
+                    }
                     updateChatRunningState();
                     if (foreground) requestCredits(true);
                     refreshMissions.run();
@@ -838,7 +948,7 @@ public final class MainActivity extends Activity {
             TextView heading = text("⚠ ПОДТВЕРЖДЕНИЕ ДЕЙСТВИЯ", 18, WHITE, true);
             padded(sheet, heading, 0);
             padded(sheet, text(title, 15, BLUE, true), 10);
-            padded(sheet, text("Прочитай полную команду ниже. Разрешение действует ТОЛЬКО один раз.", 
+            padded(sheet, text("Проверьте действие и его параметры. Разрешение действует один раз.",
                     12, MUTED, false), 10);
 
             ScrollView scroll = new ScrollView(this);
@@ -975,6 +1085,9 @@ public final class MainActivity extends Activity {
                     if (workspaceList != list || isDestroyed()) return;
                     empty.setText("В папке нет доступных файлов");
                     list.setAdapter(new WorkspaceFileAdapter(entries));
+                    if (workspacePosition < entries.size()) {
+                        list.setSelectionFromTop(workspacePosition, workspaceOffset);
+                    }
                     list.setOnItemClickListener((parent, view, position, id) -> {
                         WorkspaceZipExporter.Entry entry = entries.get(position);
                         if (entry.directory) openWorkspaceDirectory(entry.relativePath);
@@ -1017,6 +1130,11 @@ public final class MainActivity extends Activity {
     }
 
     private void openWorkspaceDirectory(String directory) {
+        if (!directory.equals(workspaceDirectory)) {
+            workspaceList = null;
+            workspacePosition = 0;
+            workspaceOffset = 0;
+        }
         workspaceDirectory = directory;
         draw();
     }
@@ -1096,6 +1214,9 @@ public final class MainActivity extends Activity {
     }
 
     private void updateWorkspaceExportControls() {
+        if (offeredProjectExport != null) {
+            offeredProjectExport.setVisibility(workspaceExport.isOffered() ? View.VISIBLE : View.GONE);
+        }
         if (workspaceExportButton == null || workspaceExport == null) return;
         WorkspaceExportSession.Phase phase = workspaceExport.phase();
         boolean busy = phase != WorkspaceExportSession.Phase.IDLE;
@@ -1114,6 +1235,7 @@ public final class MainActivity extends Activity {
         updateWorkspaceExportControls();
         if (workspaceExport == null || !resumed || isFinishing() || isDestroyed()) return;
         if (workspaceExport.phase() == WorkspaceExportSession.Phase.READY) {
+            if (workspaceExport.isOffered()) return;
             Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
             intent.setType("application/zip");
@@ -1203,8 +1325,30 @@ public final class MainActivity extends Activity {
         startActivityForResult(intent, 100);
     }
 
+    private void openProjects() {
+        if (taskRunning()) { toast("Приостановите задачу перед переключением проекта."); return; }
+        startActivityForResult(ProjectsActivity.intent(this, secrets.developerProject()), REQ_PROJECTS);
+    }
+
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_PROJECTS) {
+            if (resultCode != RESULT_OK || data == null) return;
+            String project = data.getStringExtra(ProjectsActivity.EXTRA_DIRECTORY);
+            if (project == null) return;
+            secrets.developerProject(project);
+            secrets.developerMode(true);
+            tab = 0;
+            rememberChat();
+            if (data.getBooleanExtra(ProjectsActivity.EXTRA_ANALYZE, false)) {
+                String analysis = "Изучи выбранный проект. Опиши его структуру, зависимости и конкретные проблемы.";
+                chatDraft = chatDraft.trim().isEmpty() ? analysis : chatDraft + "\n\n" + analysis;
+                draftCursor = chatDraft.length();
+                composer = null;
+            }
+            draw();
+            return;
+        }
         if (requestCode == REQ_WORKSPACE_EXPORT && workspaceExport != null) {
             if (resultCode != RESULT_OK) workspaceExport.cancelPicker(null);
             else if (data == null || data.getData() == null) {
@@ -1449,17 +1593,24 @@ public final class MainActivity extends Activity {
     private void drawActions() {
         LinearLayout navigation = new LinearLayout(this);
         navigation.setPadding(dp(10), dp(7), dp(10), 0);
-        String[] choices = {"Журнал", "Файлы", "Termux"};
+        String[] choices = {"Журнал", "Файлы", "Termux", "Диагностика"};
         for (int i = 0; i < choices.length; i++) {
             int selected = i;
             Button item = button(choices[i], actionPanel == selected);
             item.setSelected(actionPanel == selected);
+            item.setMinimumWidth(0);
+            item.setMinWidth(0);
+            item.setPadding(dp(3), 0, dp(3), 0);
+            item.setTextSize(12);
             LinearLayout.LayoutParams span = new LinearLayout.LayoutParams(0, dp(44), 1);
             if (i > 0) span.leftMargin = dp(5);
             navigation.addView(item, span);
             item.setOnClickListener(view -> {
-                actionPanel = selected;
-                draw();
+                if (selected == 3) DiagnosticsPanel.show(this, diagnostics, terminal::cancel);
+                else {
+                    actionPanel = selected;
+                    draw();
+                }
             });
         }
         mainArea.addView(navigation);
@@ -1514,7 +1665,8 @@ public final class MainActivity extends Activity {
         AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle(event.name)
                 .setView(scroll).setPositiveButton("Закрыть", null);
         if (!event.patch.isEmpty()) {
-            dialog.setNeutralButton("Изменения", (window, which) -> showCode(event.path, event.patch));
+            dialog.setNeutralButton("Изменения", (window, which) -> CodeViewer.showDiff(this, event.path,
+                    event.patch, event.reason.isEmpty() ? event.detail : event.reason));
         }
         dialog.show();
     }
@@ -1522,11 +1674,7 @@ public final class MainActivity extends Activity {
     private void showCode(String title, String code) {
         ScrollView vertical = new ScrollView(this);
         android.widget.HorizontalScrollView horizontal = new android.widget.HorizontalScrollView(this);
-        TextView body = text(code, 12, WHITE, false);
-        body.setTypeface(Typeface.MONOSPACE);
-        body.setPadding(dp(14), dp(10), dp(14), dp(10));
-        body.setHorizontallyScrolling(true);
-        body.setTextIsSelectable(true);
+        TextView body = CodeViewer.sourceText(this, CodeViewer.highlight(title, code));
         horizontal.addView(body);
         vertical.addView(horizontal);
         new AlertDialog.Builder(this).setTitle(title).setView(vertical)
@@ -1606,8 +1754,8 @@ public final class MainActivity extends Activity {
         padded(content, card, 8);
         padded(card, text(mission.status, 12, missionColor(mission.status), true), 0);
         padded(card, text(taskTitle(mission, 160), 16, WHITE, true), 4);
-        padded(card, text(mission.stage, 14, WHITE, false), 5);
-        if (mission.total > 0) {
+        padded(card, text(mission.developerMode ? mission.phase : mission.stage, 14, WHITE, false), 5);
+        if (!mission.developerMode && mission.total > 0) {
             padded(card, text(mission.completed + " из " + mission.total + " этапов по отчёту агента",
                     12, MUTED, false), 4);
             ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
@@ -1639,6 +1787,7 @@ public final class MainActivity extends Activity {
             actionMissionId = mission.id;
             actionPanel = 0;
             actionScroll = null;
+            actionScrollY = 0;
             tab = 2;
             draw();
         });
@@ -1678,6 +1827,16 @@ public final class MainActivity extends Activity {
 
     private void populateMissionDetails(LinearLayout details, MissionStore.Mission mission) {
         missionDetail(details, "Задача", mission.goal);
+        if (mission.developerMode) {
+            missionDetail(details, "Проект", mission.projectId);
+            missionDetail(details, "План", mission.plan);
+            StringBuilder phases = new StringBuilder();
+            mission.phaseStatus.forEach((phase, value) -> {
+                if (phases.length() != 0) phases.append('\n');
+                phases.append(phase).append(" · ").append(value);
+            });
+            missionDetail(details, "Этапы", phases.toString());
+        }
         missionDetail(details, "Контрольная точка", mission.summary);
         missionDetail(details, "Следующий этап", mission.next);
         missionDetail(details, "Результат", mission.result);
@@ -1732,7 +1891,9 @@ public final class MainActivity extends Activity {
             String prompt = cleanPrompt(goal.getText().toString());
             if (prompt.isEmpty()) { goal.setError("Опишите задачу"); return; }
             try {
-                missionStore.create(prompt, secrets.provider(), secrets.model());
+                boolean developer = secrets.developerMode();
+                missionStore.create(prompt, secrets.provider(), secrets.model(), "", developer,
+                        developer ? secrets.developerProject() : "");
                 dialog.dismiss();
                 draw();
             } catch (RuntimeException e) { toast(e.getMessage()); }
@@ -1764,7 +1925,7 @@ public final class MainActivity extends Activity {
                         String key = activeKey();
                         missionWorkspace(current);
                         MissionStore.Mission active = missionStore.resume(current.id, provider, model, review);
-                        String prompt = current.attempts == 0 ? active.goal : current.resumePrompt();
+                        String prompt = current.attempts == 0 || current.developerMode ? active.goal : current.resumePrompt();
                         addMessage(current.attempts == 0 ? "ТЫ" : "ТЫ · ПРОДОЛЖЕНИЕ",
                                 current.attempts == 0 ? active.goal : "Продолжить задачу " + active.shortId());
                         tab = 0;
@@ -1825,6 +1986,7 @@ public final class MainActivity extends Activity {
 
     private void showMissionDiff(MissionStore.Mission mission, String path) {
         StringBuilder diff = new StringBuilder();
+        StringBuilder reasons = new StringBuilder();
         for (MissionStore.Event event : mission.events) {
             if (path.equals(event.path) && !event.patch.isEmpty()) {
                 if (diff.length() > 24_000) {
@@ -1833,18 +1995,11 @@ public final class MainActivity extends Activity {
                 }
                 if (diff.length() > 0) diff.append('\n');
                 diff.append(event.patch);
+                if (reasons.length() > 0) reasons.append('\n');
+                reasons.append(event.reason.isEmpty() ? event.detail : event.reason);
             }
         }
-        String preview = diff.length() == 0 ? "Сохранённые изменения отсутствуют." : diff.toString();
-        ScrollView scroll = new ScrollView(this);
-        TextView body = text(preview, 12, WHITE, false);
-        body.setTypeface(Typeface.MONOSPACE);
-        body.setTextIsSelectable(true);
-        body.setPadding(dp(14), dp(8), dp(14), dp(8));
-        scroll.addView(body);
-        new AlertDialog.Builder(this).setTitle(path).setView(scroll)
-                .setNegativeButton("Закрыть", null)
-                .setPositiveButton("Открыть файл", (d, w) -> openMissionFile(mission, path)).show();
+        CodeViewer.showDiff(this, path, diff.toString(), reasons.toString());
     }
 
     private void openMissionFile(MissionStore.Mission mission, String path) {

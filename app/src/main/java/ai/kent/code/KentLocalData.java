@@ -13,6 +13,9 @@ final class KentLocalData {
     final ChatJournal chat;
     final TokenMeter tokens;
     final MissionStore missions;
+    final ProjectService projects;
+    final DiagnosticsStore diagnostics;
+    final TerminalTools terminal;
 
     private KentLocalData(Context context) throws IOException {
         workspace = new SafeWorkspace(new File(context.getFilesDir(), "workspace"));
@@ -20,6 +23,10 @@ final class KentLocalData {
         chat = new ChatJournal(context);
         tokens = new TokenMeter(context);
         missions = new MissionStore(context);
+        projects = new ProjectService(workspace, context.getCacheDir());
+        diagnostics = new DiagnosticsStore(context.getFilesDir());
+        terminal = new TerminalTools(keys, new TermuxBridge(context), new LocalTermuxBridge(keys), diagnostics,
+                context.getCacheDir());
         if (!missions.loadFailed()) missions.recoverInterrupted();
         tokens.recoverInterrupted();
     }

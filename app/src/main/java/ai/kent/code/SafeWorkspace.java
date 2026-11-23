@@ -1,10 +1,14 @@
 package ai.kent.code;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -16,6 +20,7 @@ import java.util.Objects;
 public final class SafeWorkspace {
     public static final int MAX_READ_BYTES = 120_000;
     public static final int MAX_WRITE_BYTES = 250_000;
+    static final int MAX_PROJECT_EDIT_BYTES = 8 * 1024 * 1024;
     private final File root;
     private final Path exportAnchor;
     private final Path exportLocation;
@@ -45,6 +50,7 @@ public final class SafeWorkspace {
             if (Character.isISOControl(path.charAt(i))) throw new IOException("Недопустимый символ в пути");
         }
         Path target = root.toPath();
+        if (!Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Рабочая папка недоступна");
         for (String component : path.split("/", -1)) {
             if (component.isEmpty() || ".".equals(component) || "..".equals(component)) {
                 throw new IOException("Нужен относительный путь внутри рабочего каталога");
@@ -55,13 +61,32 @@ public final class SafeWorkspace {
         return target.toFile();
     }
 
-    private void rejectSecret(String path) throws IOException {
-        String p = "/" + path.toLowerCase(Locale.ROOT).replace('\\', '/');
-        String name = p.substring(p.lastIndexOf('/') + 1);
-        if (isCredentialName(name) || p.contains("/.git/") || p.contains("/.gradle/") ||
-                name.equals(".git") || name.equals(".gradle") || name.startsWith(".kent-")) {
-            throw new IOException("Файл с секретами/служебными данными не доступен агенту");
+    File projectPath(String path) throws IOException {
+        requireProjectPath(path);
+        return resolve(path);
+    }
+
+    static void requireProjectPath(String path) throws IOException {
+        if (path == null || path.isEmpty()) throw new IOException("Выберите путь внутри рабочей папки");
+        for (String name : path.split("/", -1)) {
+            if (!safeComponent(name)) throw new IOException("Недоступный путь внутри рабочей папки: " + path);
         }
+    }
+
+    static boolean validComponent(String name) {
+        if (name.isEmpty() || name.equals(".") || name.equals("..") || name.indexOf('\\') >= 0 || name.indexOf(':') >= 0) {
+            return false;
+        }
+        for (int i = 0; i < name.length(); i++) if (Character.isISOControl(name.charAt(i))) return false;
+        return true;
+    }
+
+    static boolean safeComponent(String name) {
+        if (!validComponent(name)) return false;
+        String lower = name.toLowerCase(Locale.ROOT);
+        return !isCredentialName(lower) && !lower.equals(".git") && !lower.equals(".gradle") &&
+                !lower.equals("kent_settings.xml") && !lower.equals("kent_settings.xml.bak") &&
+                !lower.equals("kent_settings.xml.new") && !lower.startsWith(".kent-");
     }
 
     static boolean isCredentialName(String name) {
@@ -73,13 +98,29 @@ public final class SafeWorkspace {
     }
 
     public synchronized String read(String path) throws IOException {
-        File file = resolve(path);
-        rejectSecret(path);
-        if (!file.isFile()) throw new IOException("Файл не существует: " + path);
-        if (file.length() > MAX_READ_BYTES) throw new IOException("Слишком большой файл для чтения (>120 KB)");
-        byte[] bytes = Files.readAllBytes(file.toPath());
+        return read(path, MAX_READ_BYTES);
+    }
+
+    private String read(String path, int limit) throws IOException {
+        Path file = projectPath(path).toPath();
+        BasicFileAttributes attrs = requireSingleFile(file);
+        if (attrs.size() > limit) throw new IOException("Файл превышает предел одной текстовой операции: " + limit + " байт");
+        ByteArrayOutputStream output = new ByteArrayOutputStream((int) attrs.size());
+        try (InputStream input = Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS)) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                if (read > limit - output.size()) throw new IOException("Файл вырос во время чтения");
+                output.write(buffer, 0, read);
+            }
+        }
+        BasicFileAttributes after = requireSingleFile(file);
+        if (!Objects.equals(after.fileKey(), attrs.fileKey()) || !after.lastModifiedTime().equals(attrs.lastModifiedTime()) ||
+                after.size() != attrs.size() || output.size() != attrs.size()) {
+            throw new IOException("Файл изменился во время чтения. Повторите операцию.");
+        }
         try {
-            return StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(bytes)).toString();
+            return StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(output.toByteArray())).toString();
         } catch (java.nio.charset.CharacterCodingException e) {
             throw new IOException("Доступны текстовые файлы UTF-8");
         }
@@ -88,11 +129,14 @@ public final class SafeWorkspace {
     public String readPreview(String path) throws IOException { return read(path); }
 
     public synchronized void write(String path, String content) throws IOException {
-        File file = resolve(path);
-        rejectSecret(path);
-        if (file.exists() && !file.isFile()) throw new IOException("Путь занят папкой");
+        write(path, content, MAX_WRITE_BYTES);
+    }
+
+    private void write(String path, String content, int limit) throws IOException {
+        File file = projectPath(path);
+        if (file.exists()) requireSingleFile(file.toPath());
         byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
-        if (bytes.length > MAX_WRITE_BYTES) throw new IOException("Слишком большой файл (>250 KB)");
+        if (bytes.length > limit) throw new IOException("Файл превышает предел одной записи: " + limit + " байт");
         File parent = file.getParentFile();
         if (!parent.exists() && !parent.mkdirs()) throw new IOException("Не удалось создать папку");
         // Avoid partially written files when possible.
@@ -111,9 +155,21 @@ public final class SafeWorkspace {
     }
 
     synchronized String currentText(String path) throws IOException {
-        File file = resolve(path);
-        rejectSecret(path);
-        return file.exists() ? read(path) : null;
+        return currentText(path, MAX_READ_BYTES);
+    }
+
+    private String currentText(String path, int limit) throws IOException {
+        return projectPath(path).exists() ? read(path, limit) : null;
+    }
+
+    synchronized String projectCurrentText(String path) throws IOException {
+        return currentText(path, MAX_PROJECT_EDIT_BYTES);
+    }
+
+    synchronized boolean applyProjectText(String path, String before, String after) throws IOException {
+        if (!Objects.equals(projectCurrentText(path), before)) return false;
+        write(path, after, MAX_PROJECT_EDIT_BYTES);
+        return true;
     }
 
     synchronized boolean applyReviewedChange(String path, String before, String after) throws IOException {
@@ -124,15 +180,25 @@ public final class SafeWorkspace {
     }
 
     public synchronized void delete(String path) throws IOException {
-        File f = resolve(path);
-        rejectSecret(path);
-        if (!f.isFile()) throw new IOException("Можно удалять только обычные файлы");
-        Files.delete(f.toPath());
+        Path file = projectPath(path).toPath();
+        requireSingleFile(file);
+        Files.delete(file);
+    }
+
+    private static BasicFileAttributes requireSingleFile(Path file) throws IOException {
+        BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!attrs.isRegularFile() || !Integer.valueOf(1).equals(Files.getAttribute(file, "unix:nlink", LinkOption.NOFOLLOW_LINKS))) {
+            throw new IOException("Доступны только обычные файлы без ссылок");
+        }
+        return attrs;
     }
 
     public String editPreview(String path, String oldText, String newText, boolean replaceAll) throws IOException {
-        String current = read(path);
-        if (oldText == null || oldText.isEmpty() || !current.contains(oldText)) {
+        return replaceFragment(read(path), oldText, newText, replaceAll);
+    }
+
+    static String replaceFragment(String current, String oldText, String newText, boolean replaceAll) throws IOException {
+        if (current == null || oldText == null || oldText.isEmpty() || !current.contains(oldText)) {
             throw new IOException("Исходный фрагмент не найден: изменения не применены");
         }
         return replaceAll ? current.replace(oldText, newText) : current.replaceFirst(
@@ -159,7 +225,7 @@ public final class SafeWorkspace {
             if (name.equals(".git") || name.equals(".gradle") || name.equals("node_modules") || name.equals("build")) continue;
             String relative = prefix + name;
             if (Files.isSymbolicLink(file.toPath())) continue;
-            try { rejectSecret(relative); } catch (IOException e) { continue; }
+            if (!safeComponent(name)) continue;
             sb.append(relative).append(file.isDirectory() ? "/" : "").append('\n');
             count[0]++;
             if (file.isDirectory()) walk(file, relative + "/", sb, count, depth + 1);
@@ -195,5 +261,19 @@ public final class SafeWorkspace {
             if (found >= 40) break;
         }
         return out.length() == 0 ? "Ничего не найдено" : out.toString();
+    }
+
+    public static final class TextPage {
+        public final String text, revision;
+        public final long nextOffset, bytes;
+        public final boolean eof;
+
+        TextPage(String text, long nextOffset, boolean eof, long bytes, String revision) {
+            this.text = text;
+            this.nextOffset = nextOffset;
+            this.eof = eof;
+            this.bytes = bytes;
+            this.revision = revision;
+        }
     }
 }

@@ -186,4 +186,24 @@ public final class SecureKeyStore {
         prefs.edit().putBoolean("autopilot_enabled", enabled).apply();
     }
 
+    boolean developerMode() { return prefs.getBoolean("developer_mode", false); }
+
+    void developerMode(boolean enabled) {
+        prefs.edit().putBoolean("developer_mode", enabled).apply();
+    }
+
+    String developerProject() { return prefs.getString("developer_project", ""); }
+
+    void developerProject(String project) {
+        prefs.edit().putString("developer_project", project).apply();
+    }
+
+    String[] exportSecrets() {
+        try {
+            return new String[] { loadProviderKey("ai_flex"), loadProviderKey("openrouter"),
+                    bridgeToken(), loadGitHubToken() };
+        } catch (Exception e) {
+            throw new IllegalStateException("Не удалось проверить ключи приложения перед экспортом.", e);
+        }
+    }
 }

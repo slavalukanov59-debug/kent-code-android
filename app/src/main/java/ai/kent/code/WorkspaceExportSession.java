@@ -40,6 +40,7 @@ final class WorkspaceExportSession {
     private WorkspaceZipExporter.Archive archive;
     private Result result;
     private boolean closed;
+    private boolean offered;
 
     WorkspaceExportSession(Context context, WorkspaceZipExporter exporter, SecureKeyStore secrets, Bundle saved) {
         this.exporter = exporter;
@@ -48,7 +49,8 @@ final class WorkspaceExportSession {
         cache = new File(context.getCacheDir(), "workspace-zip");
         Bundle pending = saved == null ? null : saved.getBundle(SAVED_ARCHIVE);
         if (pending != null) {
-            phase = Phase.PICKER_OPEN;
+            offered = pending.getBoolean("offered");
+            phase = offered ? Phase.READY : Phase.PICKER_OPEN;
             String fileName = pending.getString("file", "");
             String title = pending.getString("title", "");
             long count = pending.getLong("count", -1);
@@ -60,12 +62,17 @@ final class WorkspaceExportSession {
                 archive = new WorkspaceZipExporter.Archive(new File(cache, fileName), title,
                         count, availableCount, bytes, sha);
             }
+            if (offered && archive == null) {
+                offered = false;
+                phase = Phase.IDLE;
+            }
         }
     }
 
     void saveState(Bundle out) {
-        if (phase != Phase.PICKER_OPEN) return;
+        if (phase != Phase.PICKER_OPEN && !offered) return;
         Bundle pending = new Bundle();
+        pending.putBoolean("offered", offered);
         if (archive != null) {
             pending.putString("file", archive.file.getName());
             pending.putString("title", archive.suggestedName);
@@ -81,6 +88,22 @@ final class WorkspaceExportSession {
     Phase phase() { return phase; }
     Result result() { return result; }
     void clearResult() { result = null; }
+    boolean isOffered() { return offered; }
+
+    boolean offer(WorkspaceZipExporter.Archive prepared) {
+        if (closed || phase != Phase.IDLE) return false;
+        clearResult();
+        archive = prepared;
+        offered = true;
+        setPhase(Phase.READY);
+        return true;
+    }
+
+    void chooseOffered() {
+        if (!offered) return;
+        offered = false;
+        setPhase(Phase.READY);
+    }
 
     void prepare(String directory) {
         if (phase != Phase.IDLE) return;
@@ -153,14 +176,7 @@ final class WorkspaceExportSession {
     }
 
     private WorkspaceZipExporter.Archive prepareArchive(String directory) throws IOException {
-        String[] excludedValues;
-        try {
-            excludedValues = new String[]{secrets.loadProviderKey("ai_flex"),
-                    secrets.loadProviderKey("openrouter"), secrets.bridgeToken(), secrets.loadGitHubToken()};
-        } catch (Exception e) {
-            throw new IOException("Не удалось проверить ключи приложения перед экспортом.");
-        }
-        return exporter.stage(directory, cache, excludedValues);
+        return exporter.stage(directory, cache, secrets.exportSecrets());
     }
 
     private void setPhase(Phase value) {

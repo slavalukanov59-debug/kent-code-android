@@ -11,16 +11,28 @@ import java.net.URLEncoder;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.net.ssl.HttpsURLConnection;
 
-/** GitHub reads and explicitly reviewed writes. Never used as an agent tool. */
+/** GitHub reads and prepared, explicitly reviewed writes. */
 public final class GitHubClient {
     private static final int MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
     private static final int MAX_FILE_BYTES = 48 * 1024;
+    // Base64 and JSON need room within the API transport budget.
+    private static final int MAX_AGENT_FILE_BYTES = MAX_RESPONSE_BYTES / 2;
     private static final int MAX_PREVIEW_CHARS = 50_000;
     private static final String COMMIT_MUTATION =
             "mutation KentFileChange($input: CreateCommitOnBranchInput!) {"
@@ -49,11 +61,105 @@ public final class GitHubClient {
     }
 
     public static final class ApiException extends IOException {
-        private final int status;
+        public final int status;
+        public final long rateLimitRemaining;
+        public final long rateLimitResetEpochSeconds;
 
         ApiException(int status, String message) {
+            this(status, message, -1, -1);
+        }
+
+        ApiException(int status, String message, long remaining, long reset) {
             super(message);
             this.status = status;
+            this.rateLimitRemaining = remaining;
+            this.rateLimitResetEpochSeconds = reset;
+        }
+    }
+
+    static final class AmbiguousWriteException extends IOException {
+        AmbiguousWriteException(Exception cause) {
+            super("GitHub не подтвердил итог операции. Проверьте состояние ветки, коммитов или PR перед повтором.", cause);
+        }
+    }
+
+    private static final class ResponseTooLargeException extends IOException {
+        ResponseTooLargeException() {
+            super("Ответ GitHub слишком большой. Откройте отдельный каталог или сравните меньший диапазон.");
+        }
+    }
+
+    public static final class TreeEntry {
+        public final String path;
+        public final String type;
+        public final String mode;
+        public final String sha;
+        public final long size;
+
+        private TreeEntry(JSONObject entry, String prefix) throws Exception {
+            path = filePath(prefix + entry.getString("path"), false);
+            type = entry.getString("type");
+            mode = entry.getString("mode");
+            sha = objectId(entry, "sha");
+            size = entry.optLong("size", -1);
+        }
+    }
+
+    public static final class RepositorySnapshot {
+        public final String repository;
+        public final String ref;
+        public final String commitSha;
+        public final List<TreeEntry> entries;
+
+        private RepositorySnapshot(String repository, String ref, String commitSha, List<TreeEntry> entries) {
+            this.repository = repository;
+            this.ref = ref;
+            this.commitSha = commitSha;
+            this.entries = java.util.Collections.unmodifiableList(entries);
+        }
+    }
+
+    public static final class BranchInfo {
+        public final String name;
+        public final String sha;
+        public final boolean protectedBranch;
+
+        private BranchInfo(JSONObject row) throws Exception {
+            name = branch(row.getString("name"));
+            sha = objectId(row.getJSONObject("commit"), "sha");
+            protectedBranch = row.optBoolean("protected");
+        }
+    }
+
+    public static final class BranchPage {
+        public final String defaultBranch;
+        public final List<BranchInfo> branches;
+        public final boolean hasMore;
+
+        private BranchPage(String defaultBranch, List<BranchInfo> branches, boolean hasMore) {
+            this.defaultBranch = defaultBranch;
+            this.branches = java.util.Collections.unmodifiableList(branches);
+            this.hasMore = hasMore;
+        }
+    }
+
+    static final class FileEdit {
+        final String path;
+        final String content;
+        final String reason;
+        final String oldText;
+        final boolean replaceAll;
+
+        FileEdit(String path, String content, String reason) {
+            this(path, content, reason, null, false);
+        }
+
+        FileEdit(String path, String content, String reason, String oldText, boolean replaceAll) {
+            this.path = path;
+            this.content = content;
+            this.reason = reason;
+            this.oldText = oldText;
+            this.replaceAll = replaceAll;
         }
     }
 
@@ -97,17 +203,14 @@ public final class GitHubClient {
         }
     }
 
-    private static final class FileChange extends Change {
-        final String path;
-        final String replacement;
+    private static final class CommitChange extends Change {
+        final List<FileEdit> files;
         final String message;
 
-        FileChange(String repo, String branch, String head, String path, String replacement,
-                   String message, String diff) {
-            super("Коммит файла", repo + " · " + branch + "\n" + head + "\n" + visible(message) + "\n\n" + diff,
-                    repo, branch, head);
-            this.path = path;
-            this.replacement = replacement;
+        CommitChange(String repo, String branch, String head, List<FileEdit> files, String message, String diff) {
+            super(files.size() == 1 ? "Коммит файла" : "Коммит файлов",
+                    repo + " · " + branch + "\n" + head + "\n" + visible(message) + "\n\n" + diff, repo, branch, head);
+            this.files = java.util.Collections.unmodifiableList(files);
             this.message = message;
         }
     }
@@ -132,15 +235,23 @@ public final class GitHubClient {
 
     private final String token;
     private final Transport transport;
+    private final AtomicBoolean cancelled = new AtomicBoolean();
+    private final AtomicReference<HttpsURLConnection> inFlight = new AtomicReference<>();
 
     public GitHubClient(String token) {
-        this(token, GitHubClient::httpRequest);
+        this(token, null);
     }
 
     GitHubClient(String token, Transport transport) {
         this.token = token == null ? "" : token;
         if (!this.token.isEmpty()) validateToken(this.token);
-        this.transport = transport;
+        this.transport = transport == null ? this::httpRequest : transport;
+    }
+
+    void cancel() {
+        cancelled.set(true);
+        HttpsURLConnection connection = inFlight.get();
+        if (connection != null) connection.disconnect();
     }
 
     public static void validateToken(String token) {
@@ -246,12 +357,320 @@ public final class GitHubClient {
                 repositoryUrl(repo) + (run > 0 ? "/actions/runs/" + run : "/actions"));
     }
 
+    Result repositories(String owner, int page) throws Exception {
+        String account = owner.trim();
+        if (account.isEmpty()) {
+            if (token.isEmpty()) throw new IOException("Сохраните токен GitHub или укажите владельца публичного репозитория.");
+        } else if (!account.matches("[A-Za-z0-9][A-Za-z0-9-]{0,38}")) {
+            throw new IllegalArgumentException("Укажите имя пользователя или организации GitHub.");
+        }
+        String route = account.isEmpty() ? "/user/repos" : "/users/" + account + "/repos";
+        String link = account.isEmpty() ? "https://github.com/dashboard" : "https://github.com/" + account;
+        JSONArray rows = new JSONArray(get(route + pageQuery(page) + "&sort=updated"));
+        StringBuilder text = pageHeader(page, rows.length());
+        for (int i = 0; i < rows.length(); i++) {
+            JSONObject row = rows.getJSONObject(i);
+            text.append(visible(row.getString("full_name"))).append(" · ")
+                    .append(visible(row.optString("default_branch"))).append(
+                            row.optBoolean("private") ? " · приватный\n" : "\n");
+        }
+        return new Result("Репозитории GitHub", text.toString(), link);
+    }
+
+    Result branches(String repository, int page) throws Exception {
+        String repo = repository(repository);
+        BranchPage result = listBranches(repo, page);
+        StringBuilder text = pageHeader(page, result.branches.size()).append("Ветка по умолчанию: ")
+                .append(visible(result.defaultBranch)).append('\n');
+        for (BranchInfo row : result.branches) {
+            text.append(visible(row.name)).append(" · ").append(row.sha)
+                    .append(row.protectedBranch ? " · защищена\n" : "\n");
+        }
+        return new Result("Ветки · " + repo, text.toString(), repositoryUrl(repo) + "/branches");
+    }
+
+    public BranchPage listBranches(String repository, int page) throws Exception {
+        String repo = repository(repository);
+        String main = defaultBranch(repo);
+        JSONArray rows = new JSONArray(get(repoRoute(repo) + "/branches" + pageQuery(page)));
+        List<BranchInfo> branches = new ArrayList<>(rows.length());
+        for (int i = 0; i < rows.length(); i++) branches.add(new BranchInfo(rows.getJSONObject(i)));
+        return new BranchPage(main, branches, rows.length() == PAGE_SIZE);
+    }
+
+    Result files(String repository, String ref, String path, int offset, int limit) throws Exception {
+        String repo = repository(repository);
+        String selected = refOrDefault(repo, ref);
+        String relative = filePath(path, true);
+        JSONObject commit = commit(repo, selected);
+        String head = objectId(commit, "sha");
+        String root = objectId(commit.getJSONObject("commit").getJSONObject("tree"), "sha");
+        TreeEntry requested = relative.isEmpty() ? null : findEntry(repo, root, relative, new HashMap<>());
+        if (!relative.isEmpty() && (requested == null || !"tree".equals(requested.type)))
+            throw new IOException("Каталог не найден в снимке " + head + ".");
+        JSONArray rows = gitTree(repo, requested == null ? root : requested.sha);
+        checkSlice(offset, limit);
+        StringBuilder text = new StringBuilder();
+        int end = offset;
+        while (end < rows.length() && end - offset < limit) {
+            TreeEntry row = new TreeEntry(rows.getJSONObject(end), relative.isEmpty() ? "" : relative + "/");
+            String line = row.type + " · " + visible(row.path) + (row.size < 0 ? "" : " · " + row.size + " B") + "\n";
+            if (text.length() + line.length() > 4_300 && end > offset) break;
+            text.append(line);
+            end++;
+        }
+        String header = "ref=" + selected + " commit_sha=" + head + " offset=" + offset
+                + " next_offset=" + (end < rows.length() ? end : "none") + " entries=" + rows.length();
+        return new Result("Файлы · " + repo, header + "\n" + text,
+                repositoryUrl(repo) + "/tree/" + head + (relative.isEmpty() ? "" : "/" + pathRoute(relative)));
+    }
+
+    Result readSource(String repository, String ref, String path, int offset, int limit, String apiKey) throws Exception {
+        checkSlice(offset, limit);
+        String repo = repository(repository);
+        String selected = refOrDefault(repo, ref);
+        String relative = filePath(path, false);
+        JSONObject commit = commit(repo, selected);
+        String head = objectId(commit, "sha");
+        String root = objectId(commit.getJSONObject("commit").getJSONObject("tree"), "sha");
+        TreeEntry entry = findEntry(repo, root, relative, new HashMap<>());
+        if (entry == null) throw new IOException("Файл не найден в снимке " + head + ".");
+        if (!"blob".equals(entry.type) || !("100644".equals(entry.mode) || "100755".equals(entry.mode)))
+            throw new IOException("Объект не является обычным файлом.");
+        if (entry.size > MAX_AGENT_FILE_BYTES) throw new IOException("Файл превышает бюджет чтения GitHub API.");
+        String source = redactSource(decodeSource(readBlob(repo, entry.sha, MAX_AGENT_FILE_BYTES)), apiKey);
+        int start = Math.min(offset, source.length());
+        if (start > 0 && start < source.length() && Character.isLowSurrogate(source.charAt(start))) start--;
+        int end = start + Math.min(Math.min(limit, 4500), source.length() - start);
+        if (end > start && end < source.length() && Character.isHighSurrogate(source.charAt(end - 1))) {
+            end += end - start == 1 ? 1 : -1;
+        }
+        String header = "commit_sha=" + head + " offset=" + start + " next_offset="
+                + (end < source.length() ? end : "none") + " total_chars=" + source.length();
+        return new Result(relative, header + "\n" + source.substring(start, end), webFile(repo, head, relative));
+    }
+
+    Result searchCode(String repository, String query, int page) throws Exception {
+        String repo = repository(repository);
+        if (token.isEmpty()) throw new IOException("Для поиска кода требуется токен GitHub.");
+        String search = query.trim();
+        if (search.isEmpty() || search.length() > 256 || search.chars().anyMatch(Character::isISOControl)
+                || search.matches("(?is).*(?:repo|org|user):.*"))
+            throw new IllegalArgumentException("Укажите запрос до 256 символов без фильтров repo:, org: или user:.");
+        JSONObject result = object("/search/code" + pageQuery(page) + "&q=" + segment(search + " repo:" + repo));
+        JSONArray rows = result.getJSONArray("items");
+        StringBuilder text = pageHeader(page, rows.length()).append("Совпадений: ")
+                .append(result.optLong("total_count")).append(" · поиск по ветке по умолчанию\n");
+        if (result.optBoolean("incomplete_results")) text.append("GitHub вернул неполные результаты.\n");
+        for (int i = 0; i < rows.length(); i++) {
+            JSONObject row = rows.getJSONObject(i);
+            if (repo.equalsIgnoreCase(row.getJSONObject("repository").getString("full_name")))
+                text.append(visible(row.getString("path"))).append('\n');
+        }
+        return new Result("Поиск · " + repo, text.toString(),
+                "https://github.com/search?type=code&q=" + segment(search + " repo:" + repo));
+    }
+
+    Result commitInfo(String repository, String ref, boolean history, int page) throws Exception {
+        String repo = repository(repository);
+        String selected = refOrDefault(repo, ref);
+        String root = repoRoute(repo) + "/commits";
+        if (history) {
+            JSONArray rows = new JSONArray(get(root + pageQuery(page) + "&sha=" + segment(selected)));
+            StringBuilder text = pageHeader(page, rows.length());
+            for (int i = 0; i < rows.length() && text.length() < MAX_PREVIEW_CHARS; i++) {
+                JSONObject row = rows.getJSONObject(i);
+                text.append(objectId(row, "sha")).append(" · ")
+                        .append(summaryLine(row.getJSONObject("commit").optString("message"))).append('\n');
+            }
+            return new Result("История · " + selected, limited(text), repositoryUrl(repo) + "/commits/" + pathRoute(selected));
+        }
+        JSONObject commit = object(root + "/" + segment(selected) + pageQuery(page));
+        String sha = objectId(commit, "sha");
+        JSONArray files = commit.optJSONArray("files");
+        StringBuilder text = pageHeader(page, files == null ? 0 : files.length()).append(sha).append('\n');
+        JSONObject detail = commit.getJSONObject("commit");
+        JSONObject author = detail.optJSONObject("author");
+        if (author != null) text.append(visible(author.optString("name"))).append(" · ")
+                .append(visible(author.optString("date"))).append('\n');
+        text.append(visible(detail.optString("message"))).append('\n');
+        if (files != null) {
+            for (int i = 0; i < files.length() && text.length() < MAX_PREVIEW_CHARS; i++) {
+                JSONObject file = files.getJSONObject(i);
+                text.append(visible(file.optString("status"))).append(" · ")
+                        .append(visible(file.getString("filename"))).append(" +")
+                        .append(file.optInt("additions")).append(" −").append(file.optInt("deletions")).append('\n');
+            }
+        }
+        return new Result("Коммит · " + selected, limited(text), repositoryUrl(repo) + "/commit/" + sha);
+    }
+
+    Result diff(String repository, String base, String head, int fileOffset, int patchOffset, String apiKey) throws Exception {
+        String repo = repository(repository);
+        String original = refOrDefault(repo, base);
+        String changed = selectedRef(head);
+        if (changed.isEmpty()) throw new IllegalArgumentException("Укажите ветку или SHA для сравнения.");
+        if (fileOffset < 0 || patchOffset < 0) throw new IllegalArgumentException("Смещение должно быть неотрицательным.");
+        JSONObject comparison = comparison(repo, original, changed);
+        JSONArray files = comparison.optJSONArray("files");
+        String url = repositoryUrl(repo) + "/compare/" + segment(original) + "..." + segment(changed);
+        if (files == null) throw new IOException("GitHub не вернул список изменённых файлов. Откройте " + url);
+        String overview = "ahead_by=" + comparison.optInt("ahead_by") + " behind_by="
+                + comparison.optInt("behind_by") + " files=" + files.length()
+                + (files.length() < 300 ? "" : " · достигнут лимит GitHub в 300 файлов") + "\n";
+        if (files.length() == 0)
+            return new Result("Diff · " + repo, overview + "Файлы не изменились.", url);
+        if (fileOffset >= files.length()) throw new IllegalArgumentException("Смещение файла выходит за список diff.");
+        JSONObject file = files.getJSONObject(fileOffset);
+        String path = visible(file.getString("filename"));
+        String earlier = file.optString("previous_filename");
+        String change = visible(file.optString("status")) + " · " + path
+                + (earlier.isEmpty() ? "" : " ← " + visible(earlier))
+                + " · +" + file.optInt("additions") + " −" + file.optInt("deletions");
+        String patch = redactSource(file.optString("patch"), apiKey);
+        int start = Math.min(patchOffset, patch.length());
+        if (start > 0 && start < patch.length() && Character.isLowSurrogate(patch.charAt(start))) start--;
+        int end = Math.min(start + 4_000, patch.length());
+        if (end < patch.length() && Character.isHighSurrogate(patch.charAt(end - 1))) end--;
+        String header = "file_offset=" + fileOffset + " next_file_offset="
+                + (fileOffset + 1 < files.length() ? fileOffset + 1 : "none")
+                + " patch_offset=" + start + " next_patch_offset=" + (end < patch.length() ? end : "none");
+        return new Result("Diff · " + repo, header + "\n" + overview + change + "\n"
+                + (patch.isEmpty() ? "GitHub не вернул текст diff этого файла." : visible(patch.substring(start, end))), url);
+    }
+
+    private String redactSource(String source, String apiKey) {
+        return SensitiveData.redact(SensitiveData.redact(source, token), apiKey);
+    }
+
+    Result workflowStatus(String repository, String branch, String headSha, long runId, int page) throws Exception {
+        String repo = repository(repository);
+        String route = repoRoute(repo) + "/actions/runs";
+        if (runId < 0) throw new IllegalArgumentException("Укажите положительный run_id.");
+        if (runId > 0) {
+            if (!branch.isEmpty() || !headSha.isEmpty())
+                throw new IllegalArgumentException("Для run_id не нужны фильтры ветки или SHA.");
+            return new Result("Запуск GitHub Actions", workflowLine(object(route + "/" + runId)),
+                    repositoryUrl(repo) + "/actions/runs/" + runId);
+        }
+        String selected = selectedRef(branch);
+        if (!headSha.isEmpty()) requireObjectId(headSha);
+        JSONObject result = object(route + pageQuery(page) + (selected.isEmpty() ? "" : "&branch=" + segment(selected))
+                + (headSha.isEmpty() ? "" : "&head_sha=" + headSha));
+        JSONArray rows = result.getJSONArray("workflow_runs");
+        StringBuilder text = pageHeader(page, rows.length());
+        for (int i = 0; i < rows.length(); i++) text.append(workflowLine(rows.getJSONObject(i)));
+        return new Result("GitHub Actions · " + repo, text.toString(), repositoryUrl(repo) + "/actions");
+    }
+
+    private static String workflowLine(JSONObject row) {
+        String result = row.isNull("conclusion") ? "" : visible(row.optString("conclusion"));
+        return visible(row.optString("name")) + " run_id=" + row.optLong("id")
+                + " · " + visible(row.optString("status")) + (result.isEmpty() ? "" : " / " + result)
+                + " · " + visible(row.optString("head_branch")) + " · " + visible(row.optString("head_sha"))
+                + " · " + visible(row.optString("updated_at")) + "\n";
+    }
+
+    private static final int PAGE_SIZE = 20;
+
+    private static String pageQuery(int page) {
+        if (page < 1) throw new IllegalArgumentException("Номер страницы должен быть положительным.");
+        return "?per_page=" + PAGE_SIZE + "&page=" + page;
+    }
+
+    private static StringBuilder pageHeader(int page, int entries) {
+        return new StringBuilder("page=").append(page).append(" next_page=")
+                .append(entries < PAGE_SIZE ? "none" : ((long) page + 1)).append('\n');
+    }
+
+    private static String summaryLine(String text) {
+        int end = text.indexOf('\n');
+        if (end < 0) end = text.length();
+        return visible(text.substring(0, Math.min(end, 160)));
+    }
+
+    private static void checkSlice(int offset, int limit) {
+        if (offset < 0 || limit < 1) throw new IllegalArgumentException("Укажите offset ≥ 0 и limit ≥ 1.");
+    }
+
+    /** Resolve the ref once and enumerate its immutable tree for project import. */
+    public RepositorySnapshot snapshot(String repository, String ref) throws Exception {
+        String repo = repository(repository);
+        String selected = refOrDefault(repo, ref);
+        JSONObject commit = commit(repo, selected);
+        String head = objectId(commit, "sha");
+        String root = objectId(commit.getJSONObject("commit").getJSONObject("tree"), "sha");
+        try {
+            JSONObject result = object(repoRoute(repo) + "/git/trees/" + root + "?recursive=1");
+            if (!result.optBoolean("truncated"))
+                return new RepositorySnapshot(repo, selected, head, treeEntries(result.getJSONArray("tree"), ""));
+        } catch (ResponseTooLargeException largeTree) {
+            // Discover the complete snapshot by walking bounded directory responses.
+        }
+        ArrayList<TreeEntry> entries = new ArrayList<>(treeEntries(gitTree(repo, root), ""));
+        ArrayDeque<TreeEntry> pending = new ArrayDeque<>();
+        for (TreeEntry entry : entries) if ("tree".equals(entry.type)) pending.add(entry);
+        while (!pending.isEmpty()) {
+            TreeEntry directory = pending.removeFirst();
+            for (TreeEntry child : treeEntries(gitTree(repo, directory.sha), directory.path + "/")) {
+                entries.add(child);
+                if ("tree".equals(child.type)) pending.addLast(child);
+            }
+        }
+        return new RepositorySnapshot(repo, selected, head, entries);
+    }
+
+    /** Read one selected blob and verify the bytes against its Git object ID. */
+    public byte[] readBlob(String repository, String sha, int maxBytes) throws Exception {
+        String repo = repository(repository);
+        requireObjectId(sha);
+        if (maxBytes < 0) throw new IllegalArgumentException("Лимит чтения файла не может быть отрицательным.");
+        JSONObject blob = object(repoRoute(repo) + "/git/blobs/" + sha);
+        if (!sha.equals(objectId(blob, "sha")) || !"base64".equals(blob.optString("encoding")))
+            throw new IOException("GitHub вернул неожиданный объект файла.");
+        long size = blob.getLong("size");
+        if (size < 0 || size > maxBytes) throw new IOException("Файл превышает лимит чтения в " + maxBytes + " байт.");
+        byte[] bytes = decodeBase64(blob);
+        if (bytes.length != size || !sha.equals(blobId(bytes)))
+            throw new IOException("Проверка целостности файла GitHub не пройдена.");
+        return bytes;
+    }
+
+    static String blobId(byte[] bytes) throws Exception {
+        // GitHub object IDs are Git's SHA-1 of the object header and bytes.
+        MessageDigest digest = MessageDigest.getInstance("SHA-1");
+        digest.update(("blob " + bytes.length + "\0").getBytes(StandardCharsets.US_ASCII));
+        byte[] hash = digest.digest(bytes);
+        StringBuilder hex = new StringBuilder(hash.length * 2);
+        for (byte value : hash) {
+            hex.append(Character.forDigit((value & 0xff) >>> 4, 16));
+            hex.append(Character.forDigit(value & 0x0f, 16));
+        }
+        return hex.toString();
+    }
+
+    private static List<TreeEntry> treeEntries(JSONArray rows, String prefix) throws Exception {
+        List<TreeEntry> entries = new ArrayList<>(rows.length());
+        for (int i = 0; i < rows.length(); i++) entries.add(new TreeEntry(rows.getJSONObject(i), prefix));
+        return entries;
+    }
+
+    private JSONArray gitTree(String repo, String sha) throws Exception {
+        JSONObject result = object(repoRoute(repo) + "/git/trees/" + sha);
+        if (result.optBoolean("truncated"))
+            throw new IOException("GitHub вернул неполный каталог. Уменьшите область запроса.");
+        return result.getJSONArray("tree");
+    }
+
     public Change prepareBranch(String repository, String sourceRef, String newBranch) throws Exception {
         requireToken();
         String repo = repository(repository);
-        String source = refOrDefault(repo, sourceRef);
         String target = branch(newBranch);
         rejectCredential(target);
+        String defaultBranch = defaultBranch(repo);
+        rejectProtectedBranch(target, defaultBranch);
+        String source = selectedRef(sourceRef);
+        if (source.isEmpty()) source = defaultBranch;
         String head = objectId(commit(repo, source), "sha");
         if (findBranchHead(repo, target) != null) throw new IOException("Ветка уже существует.");
         return new BranchChange(repo, target, head, source);
@@ -270,20 +689,79 @@ public final class GitHubClient {
     public Change prepareFile(WorkingFile opened, String replacement, String message) throws Exception {
         requireToken();
         String title = headline(message);
-        if (replacement == null || replacement.length() > MAX_FILE_BYTES)
-            throw new IllegalArgumentException("Файл должен быть текстовым и содержать до 48 КиБ.");
-        byte[] bytes = replacement.getBytes(StandardCharsets.UTF_8);
-        if (bytes.length > MAX_FILE_BYTES || !replacement.equals(new String(bytes, StandardCharsets.UTF_8)))
-            throw new IllegalArgumentException("Файл должен быть корректным UTF-8 и содержать до 48 КиБ.");
-        requireText(replacement);
-        rejectCredential(opened.path);
+        if (replacement == null) throw new IllegalArgumentException("Укажите новое содержимое файла.");
+        FileEdit edit = new FileEdit(opened.path, replacement, "");
+        String diff = reviewFile(edit, opened.text, MAX_FILE_BYTES);
         rejectCredential(title);
-        rejectCredential(replacement);
-        if (replacement.equals(opened.text)) throw new IOException("Текст файла не изменился.");
-        String diff = visible(WorkDiff.between(opened.path, opened.text, replacement));
+        return new CommitChange(opened.repo, opened.branch, opened.head,
+                java.util.Collections.singletonList(edit), title, diff);
+    }
+
+    Change prepareCommit(String repository, String targetBranch, String message, List<FileEdit> edits) throws Exception {
+        requireToken();
+        String repo = repository(repository);
+        String target = branch(targetBranch);
+        String title = headline(message);
+        rejectCredential(title);
+        requireWorkingBranch(repo, target);
+        if (edits.isEmpty()) throw new IllegalArgumentException("Укажите файлы для коммита.");
+        Set<String> paths = new HashSet<>();
+        for (FileEdit edit : edits) {
+            filePath(edit.path, false);
+            rejectCredential(edit.path);
+            if (!paths.add(edit.path)) throw new IllegalArgumentException("Путь повторяется: " + edit.path);
+        }
+        for (String path : paths) {
+            for (int parent = path.lastIndexOf('/'); parent >= 0; parent = path.lastIndexOf('/', parent - 1)) {
+                if (paths.contains(path.substring(0, parent)))
+                    throw new IllegalArgumentException("Изменения должны относиться к отдельным файлам: " + path);
+            }
+        }
+        String head = branchHead(repo, target);
+        String root = commitTree(repo, head);
+        Map<String, JSONArray> cache = new HashMap<>();
+        StringBuilder preview = new StringBuilder();
+        List<FileEdit> resolved = new ArrayList<>(edits.size());
+        long payloadBytes = 1024;
+        for (FileEdit edit : edits) {
+            String before = originalFile(repo, root, edit.path, cache, MAX_AGENT_FILE_BYTES);
+            String content = edit.oldText == null ? edit.content
+                    : SafeWorkspace.replaceFragment(before, edit.oldText, edit.content, edit.replaceAll);
+            if (content == null && before == null)
+                throw new IOException("Не найден файл для удаления: " + edit.path);
+            FileEdit file = new FileEdit(edit.path, content, edit.reason);
+            preview.append(reviewFile(file, before, MAX_AGENT_FILE_BYTES)).append('\n');
+            if (preview.length() > MAX_PREVIEW_CHARS)
+                throw new IOException("Diff слишком велик для полной проверки. Подготовьте отдельные коммиты.");
+            int contentSize = content == null ? 0 : content.getBytes(StandardCharsets.UTF_8).length;
+            payloadBytes += 6L * edit.path.length() + 128 + 4L * ((contentSize + 2) / 3);
+            if (payloadBytes > MAX_RESPONSE_BYTES)
+                throw new IOException("Коммит превышает бюджет запроса GitHub API. Подготовьте отдельные коммиты.");
+            resolved.add(file);
+        }
+        return new CommitChange(repo, target, head, resolved, title, preview.toString());
+    }
+
+    private String reviewFile(FileEdit edit, String before, int maxFileBytes) throws Exception {
+        rejectCredential(edit.path);
+        rejectCredential(edit.reason);
+        if (edit.content != null) checkReplacement(edit.content, maxFileBytes);
+        String diff = visible(WorkDiff.between(edit.path, before, edit.content));
+        if (diff.isEmpty()) throw new IOException("Текст файла не изменился: " + edit.path);
+        if (!edit.reason.isEmpty()) diff = edit.path + "\nПричина · " + visible(edit.reason) + "\n" + diff;
         if (diff.length() > MAX_PREVIEW_CHARS)
             throw new IOException("Diff слишком велик для полной проверки. Подготовьте изменение меньшего размера.");
-        return new FileChange(opened.repo, opened.branch, opened.head, opened.path, replacement, title, diff);
+        return diff;
+    }
+
+    private void checkReplacement(String replacement, int maxFileBytes) {
+        if (replacement.length() > maxFileBytes)
+            throw new IllegalArgumentException("Файл превышает лимит записи в " + maxFileBytes + " байт.");
+        byte[] bytes = replacement.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > maxFileBytes || !replacement.equals(new String(bytes, StandardCharsets.UTF_8)))
+            throw new IllegalArgumentException("Файл должен быть корректным UTF-8 и содержать до " + maxFileBytes + " байт.");
+        requireText(replacement);
+        rejectCredential(replacement);
     }
 
     public Change preparePullRequest(String repository, String targetBranch, String baseBranch, String subject,
@@ -303,7 +781,9 @@ public final class GitHubClient {
         JSONObject compare = comparison(repo, baseHead, head);
         if (compare.optInt("ahead_by", 0) <= 0)
             throw new IOException("В исходной ветке нет новых коммитов для этого PR.");
-        return new PullChange(repo, headBranch, head, base, baseHead, title, body, compareText(compare));
+        String link = repositoryUrl(repo) + "/compare/" + baseHead + "..." + head;
+        return new PullChange(repo, headBranch, head, base, baseHead, title, body,
+                "Сравнение проверяемых коммитов · " + link + "\n\n" + compareText(compare));
     }
 
     /** Each applied plan is one-time, including after an ambiguous network error. */
@@ -312,29 +792,43 @@ public final class GitHubClient {
         if (change == null || !change.submitted.compareAndSet(false, true))
             throw new IllegalStateException("Создайте новое превью для этой операции.");
         if (change instanceof BranchChange) {
+            String expectedRef = "refs/heads/" + change.branch;
             JSONObject result = post(repoRoute(change.repo) + "/git/refs", new JSONObject()
-                    .put("ref", "refs/heads/" + change.branch).put("sha", change.head));
-            return new Result("Ветка создана", result.getString("ref") + "\n" + change.head,
+                    .put("ref", expectedRef).put("sha", change.head));
+            if (!expectedRef.equals(result.optString("ref")) || !change.head.equals(receiptId(result.optJSONObject("object"), "sha")))
+                throw new AmbiguousWriteException(new IOException("Новая ветка не совпадает с превью."));
+            return new Result("Ветка создана", expectedRef + "\n" + change.head,
                     repositoryUrl(change.repo) + "/tree/" + pathRoute(change.branch));
         }
-        if (change instanceof FileChange) {
-            FileChange file = (FileChange) change;
-            requireWorkingBranch(file.repo, file.branch);
-            JSONObject branch = new JSONObject().put("repositoryNameWithOwner", file.repo)
-                    .put("branchName", file.branch);
-            JSONObject addition = new JSONObject().put("path", file.path).put("contents",
-                    Base64.getEncoder().encodeToString(file.replacement.getBytes(StandardCharsets.UTF_8)));
-            JSONObject input = new JSONObject().put("branch", branch).put("expectedHeadOid", file.head)
-                    .put("message", new JSONObject().put("headline", file.message))
-                    .put("fileChanges", new JSONObject().put("additions", new JSONArray().put(addition)));
+        if (change instanceof CommitChange) {
+            CommitChange commit = (CommitChange) change;
+            requireWorkingBranch(commit.repo, commit.branch);
+            JSONObject branch = new JSONObject().put("repositoryNameWithOwner", commit.repo)
+                    .put("branchName", commit.branch);
+            JSONArray additions = new JSONArray();
+            JSONArray deletions = new JSONArray();
+            StringBuilder paths = new StringBuilder(commit.branch).append('\n');
+            for (FileEdit edit : commit.files) {
+                JSONObject file = new JSONObject().put("path", edit.path);
+                if (edit.content == null) deletions.put(file);
+                else additions.put(file.put("contents", Base64.getEncoder().encodeToString(
+                        edit.content.getBytes(StandardCharsets.UTF_8))));
+                paths.append(visible(edit.path)).append('\n');
+            }
+            JSONObject fileChanges = new JSONObject();
+            if (additions.length() > 0) fileChanges.put("additions", additions);
+            if (deletions.length() > 0) fileChanges.put("deletions", deletions);
+            JSONObject input = new JSONObject().put("branch", branch).put("expectedHeadOid", commit.head)
+                    .put("message", new JSONObject().put("headline", commit.message))
+                    .put("fileChanges", fileChanges);
             JSONObject result = post("/graphql", new JSONObject().put("query", COMMIT_MUTATION)
                     .put("variables", new JSONObject().put("input", input)));
-            if (result.optJSONArray("errors") != null)
+            JSONArray errors = result.optJSONArray("errors");
+            if (errors != null && errors.length() > 0)
                 throw new IOException("GitHub отклонил коммит. Проверьте права токена и текущее состояние ветки, затем подготовьте новое превью.");
-            String sha = objectId(result.getJSONObject("data").getJSONObject("createCommitOnBranch")
+            String sha = receiptId(result.getJSONObject("data").getJSONObject("createCommitOnBranch")
                     .getJSONObject("commit"), "oid");
-            return new Result("Файл закоммичен", file.branch + " · " + file.path + "\n" + sha,
-                    repositoryUrl(file.repo) + "/commit/" + sha);
+            return new Result("Коммит создан", sha + "\n" + paths, repositoryUrl(commit.repo) + "/commit/" + sha);
         }
         PullChange pr = (PullChange) change;
         if (!pr.head.equals(branchHead(pr.repo, pr.branch)) || !pr.baseHead.equals(branchHead(pr.repo, pr.base)))
@@ -343,8 +837,8 @@ public final class GitHubClient {
                 .put("head", pr.branch).put("base", pr.base).put("title", pr.subject).put("body", pr.body)
                 .put("draft", true));
         int number = result.getInt("number");
-        boolean sameHeads = pr.head.equals(objectId(result.getJSONObject("head"), "sha"))
-                && pr.baseHead.equals(objectId(result.getJSONObject("base"), "sha"));
+        boolean sameHeads = pr.head.equals(receiptId(result.optJSONObject("head"), "sha"))
+                && pr.baseHead.equals(receiptId(result.optJSONObject("base"), "sha"));
         return new Result("Черновик PR #" + number, pr.subject + (sameHeads ? "" :
                 "\nВо время создания одна из веток изменилась. Проверьте фактический diff на GitHub."),
                 repositoryUrl(pr.repo) + "/pull/" + number);
@@ -394,24 +888,39 @@ public final class GitHubClient {
     }
 
     private String originalFile(String repo, String head, String relative) throws Exception {
-        JSONObject commit = object(repoRoute(repo) + "/git/commits/" + head);
-        String treeSha = objectId(commit.getJSONObject("tree"), "sha");
+        return originalFile(repo, commitTree(repo, head), relative, new HashMap<>(), MAX_FILE_BYTES);
+    }
+
+    private String commitTree(String repo, String head) throws Exception {
+        return objectId(object(repoRoute(repo) + "/git/commits/" + head).getJSONObject("tree"), "sha");
+    }
+
+    private String originalFile(String repo, String root, String relative, Map<String, JSONArray> trees,
+                                int maxFileBytes) throws Exception {
+        TreeEntry entry = findEntry(repo, root, relative, trees);
+        if (entry == null) return null;
+        if (!"100644".equals(entry.mode) || !"blob".equals(entry.type))
+            throw new IOException("Для коммита поддерживаются обычные текстовые файлы Git.");
+        if (entry.size > maxFileBytes) throw new IOException("Файл превышает лимит чтения в " + maxFileBytes + " байт.");
+        return readableFile(object(repoRoute(repo) + "/git/blobs/" + entry.sha), maxFileBytes);
+    }
+
+    private TreeEntry findEntry(String repo, String root, String relative, Map<String, JSONArray> trees) throws Exception {
+        String treeSha = root;
         String[] parts = relative.split("/");
         for (int i = 0; i < parts.length; i++) {
-            JSONObject tree = object(repoRoute(repo) + "/git/trees/" + treeSha);
-            if (tree.optBoolean("truncated")) throw new IOException("GitHub вернул неполный каталог. Проверьте файл на GitHub.");
-            JSONObject entry = matchingEntry(tree.getJSONArray("tree"), parts[i]);
-            if (entry == null) return null;
-            boolean leaf = i == parts.length - 1;
-            if (leaf) {
-                if (!"100644".equals(entry.optString("mode")) || !"blob".equals(entry.optString("type")))
-                    throw new IOException("Для коммита поддерживаются обычные текстовые файлы Git.");
-                if (entry.optLong("size", -1) > MAX_FILE_BYTES) throw new IOException("Для редактирования доступно до 48 КиБ.");
-                return readableFile(object(repoRoute(repo) + "/git/blobs/" + objectId(entry, "sha")));
+            JSONArray tree = trees.get(treeSha);
+            if (tree == null) {
+                tree = gitTree(repo, treeSha);
+                trees.put(treeSha, tree);
             }
-            if (!"tree".equals(entry.optString("type")))
+            JSONObject match = matchingEntry(tree, parts[i]);
+            if (match == null) return null;
+            TreeEntry entry = new TreeEntry(match, "");
+            if (i == parts.length - 1) return entry;
+            if (!"tree".equals(entry.type))
                 throw new IOException("Родительский путь должен указывать на каталог внутри репозитория.");
-            treeSha = objectId(entry, "sha");
+            treeSha = entry.sha;
         }
         throw new IOException("Путь к файлу недоступен.");
     }
@@ -425,10 +934,26 @@ public final class GitHubClient {
     }
 
     private static String readableFile(JSONObject file) throws Exception {
+        return readableFile(file, MAX_FILE_BYTES);
+    }
+
+    private static String readableFile(JSONObject file, int maxFileBytes) throws Exception {
         if (!"base64".equals(file.optString("encoding"))) throw new IOException("GitHub не вернул текст файла.");
+        byte[] bytes = decodeBase64(file);
+        if (bytes.length > maxFileBytes) throw new IOException("Файл превышает лимит чтения в " + maxFileBytes + " байт.");
+        return decodeSource(bytes);
+    }
+
+    private static byte[] decodeBase64(JSONObject file) throws Exception {
         try {
-            byte[] bytes = Base64.getDecoder().decode(file.getString("content").replaceAll("\\s+", ""));
-            if (bytes.length > MAX_FILE_BYTES) throw new IOException("Локальный просмотр доступен до 48 КиБ.");
+            return Base64.getDecoder().decode(file.getString("content").replaceAll("\\s+", ""));
+        } catch (IllegalArgumentException invalid) {
+            throw new IOException("GitHub вернул некорректное содержимое файла.", invalid);
+        }
+    }
+
+    private static String decodeSource(byte[] bytes) throws IOException {
+        try {
             String text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
             requireText(text);
             return text;
@@ -500,7 +1025,11 @@ public final class GitHubClient {
     }
 
     private void requireWorkingBranch(String repo, String branch) throws Exception {
-        if (branch.equals(defaultBranch(repo)))
+        rejectProtectedBranch(branch, defaultBranch(repo));
+    }
+
+    private static void rejectProtectedBranch(String target, String defaultBranch) {
+        if ("main".equalsIgnoreCase(target) || target.equalsIgnoreCase(defaultBranch))
             throw new IllegalArgumentException("Для коммита создайте отдельную рабочую ветку.");
     }
 
@@ -515,6 +1044,11 @@ public final class GitHubClient {
 
     private static String repository(String input) {
         String repo = input == null ? "" : input.trim();
+        if (repo.startsWith("https://github.com/")) {
+            repo = repo.substring("https://github.com/".length());
+            if (repo.endsWith("/")) repo = repo.substring(0, repo.length() - 1);
+            if (repo.endsWith(".git")) repo = repo.substring(0, repo.length() - 4);
+        }
         if (!repo.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,38}/[A-Za-z0-9_.-]{1,100}")
                 || repo.endsWith("/.") || repo.endsWith("/.."))
             throw new IllegalArgumentException("Укажите репозиторий в формате владелец/репозиторий.");
@@ -560,8 +1094,22 @@ public final class GitHubClient {
 
     private static String objectId(JSONObject object, String field) throws Exception {
         String sha = object.getString(field);
-        if (!sha.matches("[a-f0-9]{40}")) throw new IOException("GitHub вернул некорректный SHA.");
+        requireObjectId(sha);
         return sha;
+    }
+
+    private static void requireObjectId(String sha) throws IOException {
+        if (!sha.matches("[a-f0-9]{40}")) throw new IOException("GitHub вернул некорректный SHA.");
+    }
+
+    private static String receiptId(JSONObject object, String field) throws AmbiguousWriteException {
+        String sha = object == null ? "" : object.optString(field);
+        try {
+            requireObjectId(sha);
+            return sha;
+        } catch (IOException invalid) {
+            throw new AmbiguousWriteException(invalid);
+        }
     }
 
     private static String repoRoute(String repo) { return "/repos/" + repo; }
@@ -590,27 +1138,37 @@ public final class GitHubClient {
     private JSONObject object(String path) throws Exception { return new JSONObject(get(path)); }
 
     private String get(String path) throws IOException {
+        checkActive();
         if (!token.isEmpty()) rejectCredential(path);
         return transport.request("GET", path, null, token);
     }
 
     private JSONObject post(String path, JSONObject body) throws Exception {
+        checkActive();
         try {
             return new JSONObject(transport.request("POST", path, body, token));
         } catch (ApiException serverRejected) {
+            if (serverRejected.status >= 500 || serverRejected.status == 408)
+                throw new AmbiguousWriteException(serverRejected);
             throw serverRejected;
-        } catch (IOException uncertain) {
-            throw new IOException("Ответ GitHub не получен. Проверьте состояние ветки или списка PR перед повтором.", uncertain);
+        } catch (IOException | org.json.JSONException uncertain) {
+            throw new AmbiguousWriteException(uncertain);
         }
     }
 
-    private static String httpRequest(String method, String path, JSONObject body, String token) throws IOException {
-        if (Thread.currentThread().isInterrupted()) throw new IOException("Запрос GitHub прерван.");
+    private void checkActive() throws IOException {
+        if (cancelled.get() || Thread.currentThread().isInterrupted()) throw new IOException("Запрос GitHub прерван.");
+    }
+
+    private String httpRequest(String method, String path, JSONObject body, String token) throws IOException {
+        checkActive();
         if (!path.startsWith("/") || path.startsWith("//") || path.indexOf('#') >= 0)
             throw new IllegalArgumentException("Некорректный путь API GitHub.");
         HttpsURLConnection connection = (HttpsURLConnection) URI.create("https://api.github.com" + path)
                 .toURL().openConnection();
+        inFlight.set(connection);
         try {
+            checkActive();
             connection.setInstanceFollowRedirects(false);
             connection.setUseCaches(false);
             connection.setConnectTimeout(12_000);
@@ -628,28 +1186,41 @@ public final class GitHubClient {
                 try (java.io.OutputStream out = connection.getOutputStream()) { out.write(request); }
             }
             int code = connection.getResponseCode();
-            if (code < 200 || code >= 300) throw httpError(code, connection.getHeaderField("X-RateLimit-Remaining"));
+            if (code < 200 || code >= 300) throw httpError(code, connection.getHeaderField("X-RateLimit-Remaining"),
+                    connection.getHeaderField("X-RateLimit-Reset"), connection.getHeaderField("Retry-After"));
             try (InputStream input = connection.getInputStream();
                  ByteArrayOutputStream output = new ByteArrayOutputStream()) {
                 byte[] buffer = new byte[8192];
                 int size;
                 while ((size = input.read(buffer)) != -1) {
-                    if (Thread.currentThread().isInterrupted()) throw new IOException("Запрос GitHub прерван.");
+                    checkActive();
                     if (output.size() + size > MAX_RESPONSE_BYTES)
-                        throw new IOException("Ответ GitHub слишком большой. Откройте отдельный каталог или сравните меньший диапазон.");
+                        throw new ResponseTooLargeException();
                     output.write(buffer, 0, size);
                 }
                 return new String(output.toByteArray(), StandardCharsets.UTF_8);
             }
         } finally {
+            inFlight.compareAndSet(connection, null);
             connection.disconnect();
         }
     }
 
     static ApiException httpError(int status, String remaining) {
+        return httpError(status, remaining, null, null);
+    }
+
+    private static ApiException httpError(int status, String remaining, String reset, String retryAfter) {
+        long available = headerNumber(remaining);
+        long resetEpoch = headerNumber(reset);
+        long delay = headerNumber(retryAfter);
         String message;
-        if (status == 429 || (status == 403 && "0".equals(remaining)))
-            message = "Лимит запросов GitHub исчерпан. Повторите позже.";
+        if (status == 429 || (status == 403 && (available == 0 || delay > 0))) {
+            String retry = delay > 0 ? "Повторите через " + delay + " с."
+                    : resetEpoch > 0 && resetEpoch < 253402300799L ? "Сброс лимита в " + Instant.ofEpochSecond(resetEpoch) + "."
+                    : "Повторите позже.";
+            message = "Лимит запросов GitHub исчерпан. " + retry;
+        }
         else if (status >= 300 && status < 400)
             message = "GitHub изменил адрес ресурса. Проверьте имя репозитория или путь.";
         else if (status == 401)
@@ -663,6 +1234,14 @@ public final class GitHubClient {
         else if (status >= 500)
             message = "GitHub временно недоступен. Перед повторной записью проверьте состояние репозитория.";
         else message = "GitHub вернул HTTP " + status + ".";
-        return new ApiException(status, message);
+        return new ApiException(status, message, available, resetEpoch);
+    }
+
+    private static long headerNumber(String value) {
+        try {
+            return value == null ? -1 : Long.parseLong(value);
+        } catch (NumberFormatException invalid) {
+            return -1;
+        }
     }
 }
