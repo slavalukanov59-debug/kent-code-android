@@ -20,8 +20,8 @@ android {
         applicationId 'ai.kent.code'
         minSdk 26
         targetSdk 35
-        versionCode 16
-        versionName '0.7'
+        versionCode 17
+        versionName '0.8'
     }
     sourceSets.main.assets.srcDir labAssets
     buildTypes {

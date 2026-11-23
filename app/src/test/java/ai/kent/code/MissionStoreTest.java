@@ -144,6 +144,61 @@ public final class MissionStoreTest {
         assertEquals(4, mission.calls);
     }
 
+    @Test public void developerPlanAndProjectSurviveInterruptionWithoutReplayingPendingWrites() throws Exception {
+        MemoryFile file = new MemoryFile();
+        MissionStore store = new MissionStore(file);
+        String goal = "Исходная задача\n" + "а".repeat(18_000) + "\nВажное последнее требование";
+        MissionStore.Mission mission = store.begin(goal, "ai_flex", "model", "", true, "first");
+        assertEquals(MissionStore.STARTED, mission.phaseStatus.get(MissionStore.ANALYSIS));
+        store.plan(new JSONObject().put("analysis", "Исходники Java").put("plan", "Проверить и исправить README")
+                .put("deliverable", "project"));
+        store.selectProject("second");
+        store.recordPhase(MissionStore.EXECUTION, MissionStore.STARTED);
+        String write = store.startAction("project_write", "README.md", true);
+        store.finishAction(write, MissionStore.SUCCEEDED, "Сохранено", true, "+Инструкция", "Добавление инструкции");
+        String unresolved = store.startAction("github_create_branch", "owner/repo · feature/check", true);
+
+        MissionStore restored = new MissionStore(file);
+        restored.recoverInterrupted();
+        MissionStore.Mission recovered = restored.find(mission.id);
+        assertTrue(recovered.developerMode);
+        assertEquals("second", recovered.projectId);
+        assertEquals("Проверить и исправить README", recovered.plan);
+        assertEquals("project", recovered.deliverable);
+        assertTrue(recovered.projectFilesChanged);
+        assertEquals(MissionStore.SUCCEEDED, recovered.phaseStatus.get(MissionStore.PLAN));
+        assertEquals(MissionStore.INTERRUPTED, recovered.phaseStatus.get(MissionStore.EXECUTION));
+        assertTrue(recovered.resumePrompt().contains("Важное последнее требование"));
+        assertTrue(recovered.events.stream().anyMatch(event -> write.equals(event.id)
+                && "Добавление инструкции".equals(event.reason)));
+        assertTrue(recovered.events.stream().anyMatch(event -> unresolved.equals(event.id)
+                && MissionStore.UNKNOWN.equals(event.outcome)));
+        assertThrows(IllegalStateException.class, () -> restored.resume(mission.id, "ai_flex", "model"));
+    }
+
+    @Test public void pendingDiagnosticRequiresReviewAndOldResultDoesNotVerifyLaterChanges() {
+        MemoryFile file = new MemoryFile();
+        MissionStore store = new MissionStore(file);
+        MissionStore.Mission mission = store.begin("Проверить проект", "ai_flex", "model", "", true, "project");
+        long priorCheck = System.currentTimeMillis() - 1;
+        String write = store.startAction("project_edit", "Main.java", true);
+        store.finishAction(write, MissionStore.SUCCEEDED, "Исправлено", true);
+        assertFalse(store.recordDiagnostic("prior-job", priorCheck, MissionStore.SUCCEEDED));
+        assertFalse(store.active().diagnosticCompleted);
+
+        store.recordPhase(MissionStore.VERIFICATION, MissionStore.STARTED);
+        store.pendingDiagnostic("running-job");
+        MissionStore restored = new MissionStore(file);
+        restored.recoverInterrupted();
+        MissionStore.Mission recovered = restored.find(mission.id);
+        assertEquals(MissionStore.REVIEW, recovered.status);
+        assertEquals("running-job", recovered.pendingDiagnosticId);
+        assertEquals(MissionStore.INTERRUPTED, recovered.phaseStatus.get(MissionStore.VERIFICATION));
+        assertThrows(IllegalStateException.class, () -> restored.resume(mission.id, "ai_flex", "model"));
+        restored.resume(mission.id, "ai_flex", "model", true);
+        assertTrue(restored.active().pendingDiagnosticId.isEmpty());
+    }
+
     @Test public void corruptedLedgerIsPreservedAndRawExportRemainsAvailable() throws Exception {
         MemoryFile file = new MemoryFile();
         file.bytes = "{broken".getBytes(StandardCharsets.UTF_8);

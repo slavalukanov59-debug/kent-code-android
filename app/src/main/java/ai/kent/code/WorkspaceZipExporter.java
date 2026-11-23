@@ -7,7 +7,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.channels.Channels;
+import java.nio.channels.SeekableByteChannel;
+import java.nio.charset.CoderResult;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryIteratorException;
 import java.nio.file.DirectoryStream;
@@ -33,7 +37,6 @@ import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -193,6 +196,49 @@ public final class WorkspaceZipExporter {
         }
     }
 
+    public SafeWorkspace.TextPage readTextPage(String relativePath, long offset, int maxChars) throws IOException {
+        if (offset < 0 || maxChars < 1 || maxChars > 128 * 1024) throw new IOException("Недопустимые параметры страницы текста");
+        Path path = checkedFilePath(relativePath);
+        Path name = path.getFileName();
+        Path absolute = root.resolve(path);
+        try (SecureDirectoryStream<Path> workspace = openWorkspace();
+             SecureDirectoryStream<Path> directory = openDirectory(workspace, parentOf(path))) {
+            BasicFileAttributes attrs = requireRegularFile(directory, name, absolute);
+            if (offset > attrs.size()) throw workspaceChanged();
+            ByteBuffer input = ByteBuffer.allocate((int) Math.min(attrs.size() - offset, maxChars * 4L + 4));
+            try (SeekableByteChannel file = directory.newByteChannel(name, READ_NOFOLLOW)) {
+                file.position(offset);
+                while (input.hasRemaining()) {
+                    checkInterrupted();
+                    if (file.read(input) < 0) throw workspaceChanged();
+                }
+            }
+            input.flip();
+            CharBuffer text = CharBuffer.allocate(maxChars + 1);
+            text.limit(maxChars);
+            boolean lastChunk = offset + input.remaining() == attrs.size();
+            try {
+                var decoder = StandardCharsets.UTF_8.newDecoder();
+                CoderResult status = decoder.decode(input, text, lastChunk);
+                if (status.isOverflow() && text.remaining() == 1) {
+                    // A supplementary code point needs two UTF-16 code units and stays on one page.
+                    text.limit(maxChars + 1);
+                    status = decoder.decode(input, text, lastChunk);
+                }
+                if (status.isError()) status.throwException();
+            } catch (java.nio.charset.CharacterCodingException e) {
+                throw new IOException("Доступны страницы текста UTF-8. Используйте позицию следующей страницы.", e);
+            }
+            if (!sameRevision(attrs, requireRegularFile(directory, name, absolute))) throw workspaceChanged();
+            text.flip();
+            String output = text.toString();
+            if (output.indexOf('\u0000') >= 0) throw new IOException("Доступны текстовые файлы UTF-8");
+            long nextOffset = offset + input.position();
+            String revision = attrs.fileKey() + ":" + attrs.lastModifiedTime() + ":" + attrs.size();
+            return new SafeWorkspace.TextPage(output, nextOffset, nextOffset == attrs.size(), attrs.size(), revision);
+        }
+    }
+
     private static IOException previewSizeError() {
         return new IOException("Слишком большой файл для просмотра (>120 KB)");
     }
@@ -285,18 +331,7 @@ public final class WorkspaceZipExporter {
     }
 
     private static boolean safeName(String name) {
-        if (name.isEmpty() || name.equals(".") || name.equals("..") ||
-                name.indexOf('\\') >= 0 || name.indexOf(':') >= 0) {
-            return false;
-        }
-        for (int i = 0; i < name.length(); i++) {
-            if (Character.isISOControl(name.charAt(i))) return false;
-        }
-        String lower = name.toLowerCase(Locale.ROOT);
-        return !SafeWorkspace.isCredentialName(lower) && !lower.equals(".git") &&
-                !lower.equals(".gradle") && !lower.equals("kent_settings.xml") &&
-                !lower.equals("kent_settings.xml.bak") && !lower.equals("kent_settings.xml.new") &&
-                !lower.startsWith(".kent-");
+        return SafeWorkspace.safeComponent(name);
     }
 
     private SecureDirectoryStream<Path> openWorkspace() throws IOException {
@@ -522,7 +557,7 @@ public final class WorkspaceZipExporter {
         return files;
     }
 
-    private static MessageDigest sha256Digest() {
+    static MessageDigest sha256Digest() {
         try {
             return MessageDigest.getInstance("SHA-256");
         } catch (NoSuchAlgorithmException impossible) {
@@ -530,7 +565,7 @@ public final class WorkspaceZipExporter {
         }
     }
 
-    private static String toHex(byte[] bytes) {
+    static String toHex(byte[] bytes) {
         char[] hex = "0123456789abcdef".toCharArray();
         StringBuilder sha256 = new StringBuilder(64);
         for (byte value : bytes) {

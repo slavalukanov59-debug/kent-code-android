@@ -2,9 +2,14 @@ name: Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/kent-0.8-autonomous-developer]
   pull_request:
   workflow_dispatch:
+    inputs:
+      stable_signing:
+        description: Sign the tested APK with the provisioned permanent Android key
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -80,6 +85,20 @@ jobs:
           test -s "$APK"
           cp "$APK" KENT-CODE-debug.apk
           sha256sum KENT-CODE-debug.apk > KENT-CODE-debug.apk.sha256
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          "$SDK_ROOT/build-tools/35.0.0/apksigner" verify --print-certs KENT-CODE-debug.apk \
+            > KENT-CODE-debug.apk.certificates.txt
+          APK_SHA256="$(cut -d ' ' -f 1 KENT-CODE-debug.apk.sha256)"
+          APK_CERT_SHA256="$(awk '/^Signer #1 certificate SHA-256 digest: / {print $NF}' KENT-CODE-debug.apk.certificates.txt)"
+          echo "::notice title=APK SHA-256::$APK_SHA256"
+          echo "::notice title=APK signer SHA-256::$APK_CERT_SHA256"
+          {
+            echo '### CI debug preview'
+            echo 'Compare the APK certificate with the installed copy before attempting an update.'
+            echo
+            echo "- APK SHA-256: \`$APK_SHA256\`"
+            echo "- Signer SHA-256: \`$APK_CERT_SHA256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload APK to this GitHub Actions run
         id: apk_artifact
         uses: actions/upload-artifact@v7
@@ -92,6 +111,75 @@ jobs:
           path: |
             KENT-CODE-debug.apk
             KENT-CODE-debug.apk.sha256
+            KENT-CODE-debug.apk.certificates.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  sign-tested-apk:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.stable_signing &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/kent-0.8-autonomous-developer')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download tested APK
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.apk_artifact_id }}
+      - name: Prepare Android SDK 35
+        shell: bash
+        run: *prepare_sdk
+      # This job does not check out or execute the source tree with signing credentials.
+      - name: Sign APK and verify its certificate
+        env:
+          KENT_ANDROID_KEYSTORE_BASE64: ${{ secrets.KENT_ANDROID_KEYSTORE_BASE64 }}
+          KENT_ANDROID_KEY_ALIAS: ${{ secrets.KENT_ANDROID_KEY_ALIAS }}
+          KENT_ANDROID_STORE_PASSWORD: ${{ secrets.KENT_ANDROID_STORE_PASSWORD }}
+          KENT_ANDROID_KEY_PASSWORD: ${{ secrets.KENT_ANDROID_KEY_PASSWORD }}
+          KENT_ANDROID_CERT_SHA256: ${{ secrets.KENT_ANDROID_CERT_SHA256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          if [ -z "$KENT_ANDROID_KEYSTORE_BASE64" ] || [ -z "$KENT_ANDROID_KEY_ALIAS" ] ||
+             [ -z "$KENT_ANDROID_STORE_PASSWORD" ] || [ -z "$KENT_ANDROID_KEY_PASSWORD" ]; then
+            echo '::error::The permanent signing credentials have not been configured.'
+            exit 1
+          fi
+          EXPECTED="$(printf '%s' "$KENT_ANDROID_CERT_SHA256" | tr -d ' :\r\n' | tr '[:upper:]' '[:lower:]')"
+          if [[ ! "$EXPECTED" =~ ^[0-9a-f]{64}$ ]]; then
+            echo '::error::Configure the trusted signing certificate SHA-256.'
+            exit 1
+          fi
+          sha256sum --check KENT-CODE-debug.apk.sha256
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER="$SDK_ROOT/build-tools/35.0.0/apksigner"
+          SIGNING_DIR="$(mktemp -d)"
+          trap 'rm -rf -- "$SIGNING_DIR"' EXIT
+          printf '%s' "$KENT_ANDROID_KEYSTORE_BASE64" | base64 --decode > "$SIGNING_DIR/android.jks"
+          unset KENT_ANDROID_KEYSTORE_BASE64
+          "$APKSIGNER" sign --ks "$SIGNING_DIR/android.jks" --ks-key-alias "$KENT_ANDROID_KEY_ALIAS" \
+            --ks-pass env:KENT_ANDROID_STORE_PASSWORD --key-pass env:KENT_ANDROID_KEY_PASSWORD \
+            --out "$SIGNING_DIR/signed.apk" KENT-CODE-debug.apk
+          "$APKSIGNER" verify --print-certs "$SIGNING_DIR/signed.apk" > "$SIGNING_DIR/certificates.txt"
+          mapfile -t SIGNERS < <(awk '/^Signer #[0-9]+ certificate SHA-256 digest: / {print $NF}' "$SIGNING_DIR/certificates.txt")
+          if [ "${#SIGNERS[@]}" -ne 1 ] || [ "${SIGNERS[0],,}" != "$EXPECTED" ]; then
+            echo '::error::The signed APK certificate differs from the trusted fingerprint.'
+            exit 1
+          fi
+          mv "$SIGNING_DIR/signed.apk" KENT-CODE-stable-debug.apk
+          mv "$SIGNING_DIR/certificates.txt" KENT-CODE-stable-debug.apk.certificates.txt
+          sha256sum KENT-CODE-stable-debug.apk > KENT-CODE-stable-debug.apk.sha256
+      - name: Upload certificate-verified APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: KENT-CODE-stable-debug-${{ github.run_number }}
+          path: |
+            KENT-CODE-stable-debug.apk
+            KENT-CODE-stable-debug.apk.sha256
+            KENT-CODE-stable-debug.apk.certificates.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -99,7 +187,7 @@ jobs:
   publish:
     # Publish main builds and manually requested ZIP export previews.
     if: >-
-      (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') ||
+      (github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !inputs.stable_signing) ||
       (github.ref == 'refs/heads/feature/kent-0.7-zip-export' && github.event_name == 'workflow_dispatch')
     needs: build
     permissions:

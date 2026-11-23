@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Manually started, mutually authenticated loopback bridge for Termux."""
 import hmac
+import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
+import select
 import selectors
+import shutil
 import signal
 import socketserver
 import stat
 import struct
 import subprocess
+import tempfile
 import threading
 import time
+import zipfile
 
 HOST = "127.0.0.1"
 PORT = 47883
@@ -21,6 +26,16 @@ NONCE_BYTES = MAC_BYTES = 32
 MAX_REQUEST = 40000
 MAX_OUTPUT = 16000
 MAX_RESPONSE = 24000
+MAX_ARCHIVE = 64 * 1024 * 1024
+MAX_EXPANDED = 512 * 1024 * 1024
+PROGRAMS = ("python3", "java", "javac", "c++", "clang++", "g++", "git", "node", "gradle", "kotlinc")
+PYTHON_SYNTAX = "import ast,sys,tokenize; p=sys.argv[1]; ast.parse(tokenize.open(p).read(),filename=p)"
+PYTHON_TESTS = ("import sys,unittest\n"
+                "suite=unittest.defaultTestLoader.discover('.')\n"
+                "if not suite.countTestCases():\n print('No tests discovered',file=sys.stderr); sys.exit(4)\n"
+                "result=unittest.TextTestRunner().run(suite)\n"
+                "sys.exit(4 if result.testsRun==len(result.skipped) else 0 if result.wasSuccessful() else 1)")
+GRADLE_TASKS = ("test", "check", "lint", "testDebugUnitTest", "lintDebug", "assembleDebug")
 GUARD = threading.Lock()
 
 
@@ -83,8 +98,13 @@ def encode_result(result):
     data = encode(result)
     if len(data) <= MAX_RESPONSE - MAC_BYTES:
         return data
-    output = result["output"]
     result = result.copy()
+    if "stdout" in result:
+        # Developer runs reserve bounded space for each stream before encoding.
+        result["stdout"] = result["stdout"][:1000] + "\n[Вывод сокращён]"
+        result["stderr"] = result["stderr"][:1000] + "\n[Вывод сокращён]"
+        return encode(result)
+    output = result["output"]
     low, high = 0, len(output)
     while low < high:
         length = (low + high + 1) // 2
@@ -218,6 +238,263 @@ def run_request(home, bash, payload):
         GUARD.release()
 
 
+def checked_parts(value):
+    if not isinstance(value, str) or len(value) > 4096 or "\\" in value or ":" in value:
+        raise ValueError("Неподдерживаемый путь")
+    parts = value.split("/")
+    for part in parts:
+        if (part in ("", ".", "..") or part.lower().startswith(".kent-")
+                or part.lower() in (".git", ".gradle")
+                or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in part)):
+            raise ValueError("Неподдерживаемый путь")
+    return parts
+
+
+def developer_command(program, check, inputs):
+    if program not in PROGRAMS or not isinstance(inputs, list) or not all(isinstance(s, str) for s in inputs):
+        raise ValueError("Неподдерживаемый инструмент")
+
+    def sources(extensions):
+        for value in inputs:
+            checked_parts(value)
+            if value.startswith(("-", "@")) or not value.lower().endswith(extensions):
+                raise ValueError("Некорректный относительный путь исходного файла")
+        return inputs
+
+    snapshot = False
+    files = []
+    if check == "version" and not inputs:
+        args = ["-version" if program in ("java", "javac", "kotlinc") else "--version"]
+    elif program == "python3" and check == "syntax" and len(inputs) == 1:
+        files = sources((".py",))
+        args = ["-I", "-c", PYTHON_SYNTAX, *files]
+    elif program == "python3" and check == "tests" and not inputs:
+        args = ["-I", "-c", PYTHON_TESTS]
+        snapshot = True
+    elif program == "node" and check == "syntax" and len(inputs) == 1:
+        files = sources((".js", ".mjs", ".cjs"))
+        args = ["--check", *files]
+    elif program in ("c++", "clang++", "g++") and check in ("syntax", "compile") and inputs:
+        files = sources((".cpp", ".cc", ".cxx", ".c++"))
+        snapshot = check == "compile"
+        options = ["-o", ".kent-check-program"] if snapshot else ["-fsyntax-only"]
+        args = ["-std=c++17", *options, *files]
+    elif program == "javac" and check == "compile" and inputs:
+        files = sources((".java",))
+        args = ["-proc:none", "-d", ".kent-check-classes", *files]
+        snapshot = True
+    elif program == "kotlinc" and check == "compile" and inputs:
+        files = sources((".kt",))
+        args = ["-d", ".kent-check-classes", *files]
+        snapshot = True
+    elif program == "gradle" and check == "gradle" and inputs and all(task in GRADLE_TASKS for task in inputs):
+        args = ["--no-daemon", "--console=plain", "--rerun-tasks", "--no-build-cache", *inputs]
+        snapshot = True
+    else:
+        raise ValueError("Неподдерживаемый набор аргументов")
+    if sum(len(part.encode("utf-8")) + 1 for part in [program, *args]) > 16000:
+        raise ValueError("Слишком большой запрос")
+    return args, snapshot, files
+
+
+def receive_archive(sock, output, size, expected):
+    digest = hashlib.sha256()
+    deadline = time.monotonic() + 120
+    while size:
+        chunk = read_exact(sock, min(65536, size), deadline)
+        output.write(chunk)
+        digest.update(chunk)
+        size -= len(chunk)
+    return hmac.compare_digest(digest.hexdigest(), expected)
+
+
+class CheckCancelled(Exception):
+    pass
+
+
+def cancellation_pending(sock, proof):
+    if not select.select([sock], [], [], 0)[0]:
+        return False
+    try:
+        return hmac.compare_digest(receive_frame(sock, len(proof), time.monotonic() + 1), proof)
+    except (OSError, ValueError):
+        return True
+
+
+def extract_snapshot(archive, destination, cancelled):
+    # Each request gets a fresh private destination. Reject alternate path spellings and special files.
+    remaining = min(MAX_EXPANDED, max(0, shutil.disk_usage(destination).free - 32 * 1024 * 1024))
+    with zipfile.ZipFile(archive) as project:
+        entries = project.infolist()
+        if len(entries) > 100_000:
+            raise ValueError("Снимок содержит слишком много элементов для безопасной распаковки")
+        if sum(info.file_size for info in entries) > remaining:
+            raise ValueError("Снимок превышает безопасный объём распаковки или доступное место")
+        seen = set()
+        for info in entries:
+            if cancelled():
+                raise CheckCancelled()
+            parts = checked_parts(info.filename[:-1] if info.is_dir() else info.filename)
+            kind = stat.S_IFMT(info.external_attr >> 16)
+            if (kind not in (0, stat.S_IFREG, stat.S_IFDIR) or
+                    kind == stat.S_IFDIR and not info.is_dir() or kind == stat.S_IFREG and info.is_dir()):
+                raise ValueError("Специальные файлы в снимке не поддерживаются")
+            path = destination.joinpath(*parts)
+            if path in seen:
+                raise ValueError("Повторяющийся путь в снимке")
+            seen.add(path)
+            if info.is_dir():
+                path.mkdir(parents=True, exist_ok=True)
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with project.open(info) as source, path.open("xb") as target:
+                while True:
+                    if cancelled():
+                        raise CheckCancelled()
+                    data = source.read(65536)
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    if remaining < 0:
+                        raise ValueError("Размер распаковки превышен")
+                    target.write(data)
+
+
+def developer_output(proc, sock, cancel_proof, seconds):
+    buffers = {proc.stdout: bytearray(), proc.stderr: bytearray()}
+    status = "exited"
+    detached = False
+    truncated = False
+    deadline = time.monotonic() + seconds
+    drain_until = None
+    with selectors.DefaultSelector() as selector:
+        for stream in buffers:
+            selector.register(stream, selectors.EVENT_READ)
+        selector.register(sock, selectors.EVENT_READ)
+        while True:
+            now = time.monotonic()
+            if now >= deadline and proc.poll() is None:
+                status = "timeout"
+                kill_group(proc)
+                proc.wait(timeout=5)
+            if proc.poll() is not None:
+                if drain_until is None:
+                    # Child processes in the command's group must not outlive the job.
+                    kill_group(proc)
+                    drain_until = now + 0.25
+                if not any(stream.fileno() in selector.get_map() for stream in buffers):
+                    break
+                if now >= drain_until:
+                    detached = True
+                    break
+            for key, _ in selector.select(0.1):
+                if key.fileobj is sock:
+                    if not cancellation_pending(sock, cancel_proof):
+                        continue
+                    selector.unregister(sock)
+                    if proc.poll() is None:
+                        status = "cancelled"
+                        kill_group(proc)
+                        proc.wait(timeout=5)
+                    continue
+                block = os.read(key.fd, 4096)
+                if not block:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffer = buffers[key.fileobj]
+                free = max(0, 8000 - len(buffer))
+                truncated |= len(block) > free
+                buffer.extend(block[:free])
+    detail = "[Вывод сокращён]" if truncated else ""
+    return dict(status=status, exitCode=proc.returncode, detached=detached,
+                stdout=buffers[proc.stdout].decode("utf-8", "replace"),
+                stderr=buffers[proc.stderr].decode("utf-8", "replace"), detail=detail)
+
+
+def run_developer(home, bash, request, sock, cancel_proof, ready):
+    if os.geteuid() == 0:
+        return reject("Для проверки проекта запустите мост под обычным пользователем Termux.")
+    try:
+        program = request["program"]
+        args, needs_snapshot, inputs = developer_command(program, request["check"], request.get("inputs", []))
+        if request["argv"] != [program, *args]:
+            raise ValueError("Команда отличается от предварительного просмотра")
+        seconds = request["timeout"]
+        size = request.get("archiveBytes", 0)
+        digest = request.get("archiveSha256", "")
+        directory = request["workDir"]
+        if (type(seconds) is not int or not 1 <= seconds <= 120 or type(size) is not int
+                or not 0 <= size <= MAX_ARCHIVE or needs_snapshot and not size):
+            raise ValueError("Недопустимый размер снимка или таймаут")
+        if size and (not isinstance(digest, str) or len(digest) != 64
+                     or any(c not in "0123456789abcdef" for c in digest)):
+            raise ValueError("Некорректная контрольная сумма снимка")
+        if directory != ".":
+            checked_parts(directory)
+    except (KeyError, ValueError, TypeError, UnicodeError, RecursionError):
+        return reject("Недопустимые параметры проверки Termux.")
+    if not GUARD.acquire(blocking=False):
+        return reject("В мосте уже выполняется команда.")
+    try:
+        bin_directory = str(Path(bash).parent)
+        executable = shutil.which(program, path=bin_directory)
+        if executable is None:
+            return dict(status="exited", exitCode=127, detached=False, stdout="", stderr="",
+                        detail=f"Инструмент {program} не найден в {bin_directory}")
+        with tempfile.TemporaryDirectory(prefix="check-", dir=home / ".kent-bridge") as tmp:
+            work = Path(tmp)
+            def cancelled():
+                return cancellation_pending(sock, cancel_proof)
+
+            if size:
+                if size > shutil.disk_usage(work).free:
+                    return reject("Недостаточно свободного места для снимка.")
+                archive = work / "snapshot.zip"
+                ready()
+                with archive.open("wb") as output:
+                    if not receive_archive(sock, output, size, digest):
+                        return reject("Контрольная сумма снимка не совпала.")
+                project = work / "project"
+                project.mkdir()
+                extract_snapshot(archive, project, cancelled)
+                archive.unlink()
+                cwd = resolve_workspace(project, directory, "termux")
+            else:
+                cwd = resolve_workspace(home, directory, "termux")
+            for name in inputs:
+                file = cwd.joinpath(*checked_parts(name)).resolve(strict=True)
+                if not file.is_relative_to(cwd) or not file.is_file():
+                    return reject("Исходный файл недоступен внутри выбранной папки.")
+            check_home = work / "home"
+            check_home.mkdir()
+            env = {key: os.environ[key] for key in
+                   ("ANDROID_ROOT", "ANDROID_DATA", "ANDROID_HOME", "ANDROID_SDK_ROOT", "PREFIX", "LANG",
+                    "LD_LIBRARY_PATH", "LD_PRELOAD", "JAVA_HOME")
+                   if key in os.environ}
+            env.update(HOME=str(check_home), TMPDIR=str(work), PATH=bin_directory)
+            if cancelled():
+                raise CheckCancelled()
+            proc = subprocess.Popen([executable, *args], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            try:
+                return developer_output(proc, sock, cancel_proof, seconds)
+            finally:
+                proc.stdout.close()
+                proc.stderr.close()
+                if proc.poll() is None:
+                    kill_group(proc)
+                    proc.wait(timeout=5)
+    except CheckCancelled:
+        return dict(status="cancelled", exitCode=None, detached=False, stdout="", stderr="",
+                    detail="Запуск отменён до создания процесса.")
+    except (zipfile.BadZipFile, ValueError, FileNotFoundError) as error:
+        return reject(f"Не удалось подготовить рабочую папку: {error}")
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "unknown"}
+    finally:
+        GUARD.release()
+
+
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         sock = self.request
@@ -234,10 +511,20 @@ class Handler(socketserver.BaseRequestHandler):
             request_mac, payload = request[:MAC_BYTES], request[MAC_BYTES:]
             if not hmac.compare_digest(request_mac, signature(token, b"request", client_nonce, server_nonce, payload)):
                 return
-            result = encode_result(run_request(self.server.home, self.server.bash, payload))
-            sock.settimeout(2)
-            send_frame(sock, signature(token, b"response", client_nonce, server_nonce, result) + result)
-        except (OSError, ValueError):
+
+            def respond(value):
+                result = encode_result(value)
+                sock.settimeout(2)
+                send_frame(sock, signature(token, b"response", client_nonce, server_nonce, result) + result)
+
+            decoded = json.loads(payload.decode("utf-8"))
+            if isinstance(decoded, dict) and decoded.get("mode") == "developer":
+                cancel_proof = signature(token, b"cancel", client_nonce, server_nonce)
+                respond(run_developer(self.server.home, self.server.bash, decoded, sock, cancel_proof,
+                                      lambda: respond({"status": "ready"})))
+            else:
+                respond(run_request(self.server.home, self.server.bash, payload))
+        except (OSError, ValueError, RecursionError):
             return
 
 
@@ -272,7 +559,7 @@ class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 def main(home, bash):
     with Server(home, bash) as server:
-        print("KENT BRIDGE 0.6 · 127.0.0.1:%s" % PORT, flush=True)
+        print("KENT BRIDGE 0.8 · 127.0.0.1:%s" % PORT, flush=True)
         print("Файл токена: ~/.kent-bridge/token. Остановить мост: Ctrl+C.", flush=True)
         try:
             server.serve_forever()

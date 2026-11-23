@@ -88,6 +88,34 @@ public class KentAgentTest {
         assertEquals(MissionStore.REVIEW, missions.find(mission.id).status);
     }
 
+    @Test public void developerModeDoesNotReportUndeliveredProjectAsComplete() throws Exception {
+        SafeWorkspace workspace = new SafeWorkspace(temporary.newFolder());
+        workspace.write("private-workspace.txt", "Данные прежней рабочей области");
+        MissionStore missions = newStore();
+        MissionStore.Mission mission = missions.begin("Создать проект", "ai_flex", "model", "", true, "");
+        ArrayDeque<JSONObject> responses = new ArrayDeque<>();
+        responses.add(calls(tool("plan", "mission_plan", new JSONObject().put("analysis", "Новая задача")
+                .put("plan", "Записать файл main.cpp").put("deliverable", "project"))));
+        responses.add(calls(tool("legacy", "write_file", new JSONObject().put("path", "main.cpp")
+                .put("content", "int main() {}"))));
+        responses.add(response("stop", new JSONObject().put("content", "Проект полностью создан")));
+        TestEvents events = new TestEvents(true);
+        new KentAgent(workspace, tokenMeter(), missions, events, (active, key, context) -> {
+            assertFalse(context.toString().contains("private-workspace.txt"));
+            return responses.removeFirst();
+        }).task(mission, mission.goal, true, KEY);
+
+        MissionStore.Mission saved = missions.find(mission.id);
+        assertEquals(0, events.approvals);
+        assertNull(workspace.currentText("main.cpp"));
+        assertEquals(MissionStore.REVIEW, saved.status);
+        assertEquals(MissionStore.SUCCEEDED, saved.phaseStatus.get(MissionStore.PLAN));
+        assertEquals(MissionStore.FAILED, saved.phaseStatus.get(MissionStore.RESULT));
+        assertFalse(saved.canMarkVerified());
+        assertTrue(saved.result.contains("Подтверждённых изменений файлов проекта: 0"));
+        assertFalse(events.logs.stream().anyMatch(log -> log.contains("Проект полностью создан")));
+    }
+
     private static JSONObject tool(String id, String name, JSONObject arguments) throws Exception {
         return new JSONObject().put("id", id).put("type", "function").put("function",
                 new JSONObject().put("name", name).put("arguments", arguments.toString()));

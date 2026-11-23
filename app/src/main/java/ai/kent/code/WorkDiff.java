@@ -11,6 +11,14 @@ final class WorkDiff {
     private WorkDiff() {}
 
     static String between(String path, String before, String after) throws IOException {
+        return between(path, before, after, false);
+    }
+
+    static String preview(String path, String before, String after) throws IOException {
+        return between(path, before, after, true);
+    }
+
+    private static String between(String path, String before, String after, boolean truncate) throws IOException {
         if (Objects.equals(before, after)) return "";
         String[] oldLines = lines(before);
         String[] newLines = lines(after);
@@ -34,10 +42,15 @@ final class WorkDiff {
         diff.append("@@ -").append(oldCount == 0 ? start : start + 1).append(',').append(oldCount)
                 .append(" +").append(newCount == 0 ? start : start + 1).append(',').append(newCount)
                 .append(" @@\n");
-        append(diff, ' ', oldLines, start, prefix);
-        append(diff, '-', oldLines, prefix, oldEnd);
-        append(diff, '+', newLines, prefix, newEnd);
-        append(diff, ' ', oldLines, oldEnd, oldEnd + contextAfter);
+        boolean complete = append(diff, ' ', oldLines, start, prefix)
+                && append(diff, '-', oldLines, prefix, oldEnd)
+                && append(diff, '+', newLines, prefix, newEnd)
+                && append(diff, ' ', oldLines, oldEnd, oldEnd + contextAfter);
+        if (!complete) {
+            if (!truncate) throw new IOException("Изменение слишком велико для проверки. Разбейте его на части.");
+            diff.setLength(Math.min(diff.length(), MAX_PREVIEW_CHARS - 50));
+            diff.append("\n[Дальнейшие строки доступны в файле проекта]\n");
+        }
         return diff.toString();
     }
 
@@ -45,14 +58,16 @@ final class WorkDiff {
         return value == null || value.isEmpty() ? new String[0] : value.split("(?<=\\n)(?!\\z)");
     }
 
-    private static void append(StringBuilder out, char marker, String[] lines, int from, int to)
-            throws IOException {
+    private static boolean append(StringBuilder out, char marker, String[] lines, int from, int to) {
         for (int i = from; i < to; i++) {
-            out.append(marker).append(lines[i]);
+            String line = lines[i];
+            int available = MAX_PREVIEW_CHARS - out.length() - 1;
+            if (available < 1) return false;
+            out.append(marker).append(line, 0, Math.min(line.length(), available));
+            if (line.length() > available) return false;
             if (!lines[i].endsWith("\n")) out.append("\n\\ No newline at end of file\n");
-            if (out.length() > MAX_PREVIEW_CHARS) {
-                throw new IOException("Изменение слишком велико для проверки. Разбейте его на части.");
-            }
+            if (out.length() > MAX_PREVIEW_CHARS) return false;
         }
+        return true;
     }
 }

@@ -42,6 +42,14 @@ public final class MissionStore {
     public static final String UNKNOWN = "результат неизвестен";
     public static final String INTERRUPTED = "прервано";
 
+    public static final String ANALYSIS = "Анализ";
+    public static final String PLAN = "План";
+    public static final String EXECUTION = "Выполнение";
+    public static final String VERIFICATION = "Проверка";
+    public static final String FIX = "Исправление";
+    public static final String RESULT = "Результат";
+    private static final String[] PHASES = {ANALYSIS, PLAN, EXECUTION, VERIFICATION, FIX, RESULT};
+
     private static final int SCHEMA = 2;
     private static final int MAX_FILE_BYTES = 16 * 1024 * 1024;
     private static final int RECENT_EVENTS = 72;
@@ -58,13 +66,13 @@ public final class MissionStore {
     }
 
     public static final class Event {
-        public final String id, kind, name, path, detail, outcome, patch;
+        public final String id, kind, name, path, detail, outcome, patch, reason;
         public final long time;
         public final boolean requiresReview, acknowledged, changed;
 
         private Event(String id, long time, String kind, String name, String path,
                       String detail, String outcome, boolean requiresReview, String patch,
-                      boolean acknowledged, boolean changed) {
+                      String reason, boolean acknowledged, boolean changed) {
             this.id = id;
             this.time = time;
             this.kind = kind;
@@ -74,6 +82,7 @@ public final class MissionStore {
             this.outcome = outcome;
             this.requiresReview = requiresReview;
             this.patch = patch;
+            this.reason = reason;
             this.acknowledged = acknowledged;
             this.changed = changed;
         }
@@ -82,28 +91,40 @@ public final class MissionStore {
             this(data.optString("id"), data.optLong("time"), data.optString("kind"),
                     data.optString("name"), data.optString("path"), data.optString("detail"),
                     data.optString("outcome"), data.optBoolean("requiresReview"), data.optString("patch"),
-                    data.optBoolean("acknowledged"), data.optBoolean("changed"));
+                    data.optString("reason"), data.optBoolean("acknowledged"), data.optBoolean("changed"));
         }
 
         private JSONObject toJson() throws JSONException {
             return new JSONObject().put("id", id).put("time", time).put("kind", kind)
                     .put("name", name).put("path", path).put("detail", detail)
                     .put("outcome", outcome).put("requiresReview", requiresReview)
-                    .put("patch", patch).put("acknowledged", acknowledged).put("changed", changed);
+                    .put("patch", patch).put("reason", reason).put("acknowledged", acknowledged).put("changed", changed);
         }
 
         private Event completed(String outcome, String detail, String patch, boolean changed) {
-            return new Event(id, time, kind, name, path, detail, outcome, requiresReview, patch, acknowledged, changed);
+            return completed(outcome, detail, patch, reason, changed);
+        }
+
+        private Event completed(String outcome, String detail, String patch, String reason, boolean changed) {
+            return new Event(id, time, kind, name, path, detail, outcome, requiresReview, patch, reason,
+                    acknowledged, changed);
         }
 
         private Event acknowledge() {
-            return new Event(id, time, kind, name, path, detail, outcome, requiresReview, patch, true, changed);
+            return new Event(id, time, kind, name, path, detail, outcome, requiresReview, patch, reason, true, changed);
         }
     }
 
     public static final class Mission {
         public String id, goal, provider, model, status, stage, summary, next, lastTool;
         public String error = "", result = "", structure = "", decisions = "", workspaceId = "", reportedModel = "";
+        public boolean developerMode;
+        public String projectId = "", phase = "", plan = "", analysis = "", deliverable = "analysis";
+        public final Map<String, String> phaseStatus = new LinkedHashMap<>();
+        public int completedActions, failedActions, deniedActions;
+        public boolean projectCreated, projectFilesChanged, githubCommitPublished, diagnosticCompleted;
+        public String pendingDiagnosticId = "";
+        private long lastProjectChange;
         public int completed, total, calls, tools, attempts, lastSessionCalls;
         public int tokenCalls, inputCalls, outputCalls, costedCalls;
         public long tokens, inputTokens, outputTokens, lastSessionTokens, created, updated, legacyTokenTotal;
@@ -121,12 +142,16 @@ public final class MissionStore {
         private String lastRead = "";
         private boolean reviewRequired;
 
-        private Mission(String goal, String provider, String model, String workspaceId) {
+        private Mission(String goal, String provider, String model, String workspaceId,
+                        boolean developerMode, String projectId) {
             id = UUID.randomUUID().toString();
             this.goal = goal;
             this.provider = provider;
             this.model = model;
             this.workspaceId = workspaceId;
+            this.developerMode = developerMode;
+            this.projectId = projectId;
+            if (developerMode) for (String name : PHASES) phaseStatus.put(name, WAITING);
             status = WAITING;
             stage = "Подготовка";
             summary = "";
@@ -152,6 +177,25 @@ public final class MissionStore {
             structure = data.optString("structure");
             decisions = data.optString("decisions");
             workspaceId = data.optString("workspaceId");
+            developerMode = data.optBoolean("developerMode");
+            projectId = data.optString("projectId");
+            phase = data.optString("phase");
+            plan = data.optString("plan");
+            analysis = data.optString("analysis");
+            deliverable = data.optString("deliverable", "analysis");
+            completedActions = data.optInt("completedActions");
+            failedActions = data.optInt("failedActions");
+            deniedActions = data.optInt("deniedActions");
+            projectCreated = data.optBoolean("projectCreated");
+            projectFilesChanged = data.optBoolean("projectFilesChanged");
+            githubCommitPublished = data.optBoolean("githubCommitPublished");
+            diagnosticCompleted = data.optBoolean("diagnosticCompleted");
+            pendingDiagnosticId = data.optString("pendingDiagnosticId");
+            lastProjectChange = data.optLong("lastProjectChange");
+            JSONObject phases = data.optJSONObject("phaseStatus");
+            if (developerMode) for (String name : PHASES) {
+                phaseStatus.put(name, phases == null ? WAITING : phases.optString(name, WAITING));
+            }
             completed = data.optInt("completed");
             total = data.optInt("total");
             calls = data.optInt("calls");
@@ -203,6 +247,14 @@ public final class MissionStore {
                     .put("summary", summary).put("next", next).put("lastTool", lastTool)
                     .put("error", error).put("result", result).put("structure", structure)
                     .put("decisions", decisions).put("workspaceId", workspaceId)
+                    .put("developerMode", developerMode).put("projectId", projectId)
+                    .put("phase", phase).put("phaseStatus", new JSONObject(phaseStatus))
+                    .put("plan", plan).put("analysis", analysis).put("deliverable", deliverable)
+                    .put("completedActions", completedActions)
+                    .put("failedActions", failedActions).put("deniedActions", deniedActions)
+                    .put("projectCreated", projectCreated).put("projectFilesChanged", projectFilesChanged)
+                    .put("githubCommitPublished", githubCommitPublished).put("diagnosticCompleted", diagnosticCompleted)
+                    .put("pendingDiagnosticId", pendingDiagnosticId).put("lastProjectChange", lastProjectChange)
                     .put("completed", completed).put("total", total)
                     .put("calls", calls).put("tools", tools).put("attempts", attempts).put("resultAttempt", resultAttempt)
                     .put("tokenCalls", tokenCalls).put("inputCalls", inputCalls).put("outputCalls", outputCalls)
@@ -244,6 +296,7 @@ public final class MissionStore {
 
         public boolean canMarkVerified() {
             return REVIEW.equals(status) && !result.trim().isEmpty() && resultAttempt == attempts
+                    && (!developerMode || SUCCEEDED.equals(phaseStatus.get(RESULT)) && pendingDiagnosticId.isEmpty())
                     && events.stream().noneMatch(event -> event.requiresReview && !event.acknowledged
                             && UNKNOWN.equals(event.outcome));
         }
@@ -251,7 +304,7 @@ public final class MissionStore {
         /** Selected mission memory is supplied as evidence, including action outcomes and uncertainty. */
         public String resumePrompt() {
             StringBuilder prompt = new StringBuilder("Продолжение задачи ").append(shortId()).append(".\n\n");
-            section(prompt, "Исходная задача", goal, 16_000);
+            section(prompt, "Исходная задача", goal, Integer.MAX_VALUE);
             return prompt.append(contextSummary()).toString();
         }
 
@@ -269,6 +322,12 @@ public final class MissionStore {
                 }
             }
             section(prompt, "Этап", stage, 160);
+            section(prompt, "Открытый проект", projectId, 500);
+            section(prompt, "Проверка без подтверждённого завершения", pendingDiagnosticId, 100);
+            section(prompt, "Текущий этап выполнения", phase, 160);
+            section(prompt, "Технический план", plan, 4_200);
+            if (developerMode && !plan.isEmpty()) section(prompt, "Требуемый результат", deliverable, 80);
+            section(prompt, "Результаты анализа", analysis, 1_200);
             section(prompt, "Последняя контрольная точка модели", summary, 2_200);
             section(prompt, "Следующий этап", next, 1_100);
             section(prompt, "Важные решения", decisions, 2_200);
@@ -280,7 +339,16 @@ public final class MissionStore {
             for (int index = Math.max(0, events.size() - CONTEXT_EVENTS); index < events.size(); index++) {
                 Event event = events.get(index);
                 prompt.append(event.name).append(' ').append(event.outcome).append(' ')
-                        .append(clip(event.path, 100)).append(' ').append(clip(event.detail, 60)).append('\n');
+                        .append(clip(event.path, 200)).append(' ').append(clip(event.detail, 250)).append('\n');
+            }
+            int failures = 0;
+            HashSet<String> seenFailures = new HashSet<>();
+            for (int index = events.size() - CONTEXT_EVENTS - 1; index >= 0 && failures < 3; index--) {
+                Event event = events.get(index);
+                if (!FAILED.equals(event.outcome) || !seenFailures.add(event.name + "\n" + event.path)) continue;
+                prompt.append("Ранее зафиксированная ошибка ").append(event.name).append(' ')
+                        .append(clip(event.path, 200)).append(' ').append(clip(event.detail, 300)).append('\n');
+                failures++;
             }
             return prompt.toString();
         }
@@ -291,8 +359,16 @@ public final class MissionStore {
             section(report, "Провайдер и запрошенная модель", provider + " / " + model, Integer.MAX_VALUE);
             section(report, "Модель по ответу провайдера", reportedModel, Integer.MAX_VALUE);
             section(report, "Рабочая копия", workspaceId, Integer.MAX_VALUE);
+            section(report, "Открытый проект", projectId, Integer.MAX_VALUE);
             section(report, "Исходная задача", goal, Integer.MAX_VALUE);
             section(report, "Этап", stage + (total > 0 ? " (" + completed + "/" + total + ")" : ""), Integer.MAX_VALUE);
+            section(report, "Анализ", analysis, Integer.MAX_VALUE);
+            section(report, "Технический план", plan, Integer.MAX_VALUE);
+            if (developerMode) {
+                report.append("Этапы выполнения\n");
+                phaseStatus.forEach((name, outcome) -> report.append(name).append(' ').append(outcome).append('\n'));
+                report.append('\n');
+            }
             section(report, "Контрольная точка модели", summary, Integer.MAX_VALUE);
             section(report, "Следующий этап", next, Integer.MAX_VALUE);
             section(report, "Важные решения", decisions, Integer.MAX_VALUE);
@@ -311,6 +387,7 @@ public final class MissionStore {
             for (Event event : events) {
                 report.append(event.time).append(' ').append(event.name).append(' ').append(event.path)
                         .append(' ').append(event.outcome).append(' ').append(event.detail).append('\n');
+                if (!event.reason.isEmpty()) report.append(event.reason).append('\n');
                 if (!event.patch.isEmpty()) report.append(event.patch).append('\n');
             }
             return report.toString();
@@ -507,10 +584,11 @@ public final class MissionStore {
         }
     }
 
-    private Mission add(String goal, String provider, String model, String workspaceId, boolean start) {
+    private Mission add(String goal, String provider, String model, String workspaceId,
+                        boolean developerMode, String projectId, boolean start) {
         if (goal == null || goal.trim().isEmpty()) throw new IllegalArgumentException("Введите задачу");
         if (start && !activeId.isEmpty()) throw new IllegalStateException("Уже выполняется другая задача");
-        Mission mission = new Mission(goal, provider, model, workspaceId);
+        Mission mission = new Mission(goal, provider, model, workspaceId, developerMode, projectId);
         if (start) start(mission, provider, model, false);
         else addEvent(mission, event("state", WAITING, "", "", "", false));
         missions.add(0, mission);
@@ -532,11 +610,21 @@ public final class MissionStore {
     }
 
     public synchronized Mission create(String goal, String provider, String model, String workspaceId) {
-        return add(goal, provider, model, workspaceId, false);
+        return create(goal, provider, model, workspaceId, false, "");
+    }
+
+    public synchronized Mission create(String goal, String provider, String model, String workspaceId,
+                                       boolean developerMode, String projectId) {
+        return add(goal, provider, model, workspaceId, developerMode, projectId, false);
     }
 
     public synchronized Mission begin(String goal, String provider, String model) {
-        return add(goal, provider, model, "", true);
+        return begin(goal, provider, model, "", false, "");
+    }
+
+    public synchronized Mission begin(String goal, String provider, String model, String workspaceId,
+                                      boolean developerMode, String projectId) {
+        return add(goal, provider, model, workspaceId, developerMode, projectId, true);
     }
 
     private static void start(Mission mission, String provider, String model, boolean acknowledged) {
@@ -555,6 +643,10 @@ public final class MissionStore {
         mission.lastSessionCost = null;
         mission.lastRequestCost = null;
         mission.lastRead = "";
+        mission.completedActions = 0;
+        mission.failedActions = 0;
+        mission.deniedActions = 0;
+        if (mission.developerMode) recordPhase(mission, ANALYSIS, STARTED);
         mission.status = RUNNING;
         mission.updated = System.currentTimeMillis();
         mission.startedAt = mission.updated;
@@ -567,6 +659,7 @@ public final class MissionStore {
             }
             addEvent(mission, event("review", "Пользователь разрешил продолжение после проверки", "", "", "", false));
             mission.reviewRequired = false;
+            mission.pendingDiagnosticId = "";
         }
         addEvent(mission, event("state", RUNNING, "", model, "", false));
     }
@@ -610,6 +703,11 @@ public final class MissionStore {
     }
 
     private static void settlePendingActions(Mission mission) {
+        if (!mission.pendingDiagnosticId.isEmpty()) {
+            mission.reviewRequired = true;
+            addEvent(mission, event("state", "Ожидался результат Termux", mission.pendingDiagnosticId,
+                    "Проверьте последнее состояние в диагностике перед повторным запуском.", UNKNOWN, false));
+        }
         for (int i = 0; i < mission.events.size(); i++) {
             Event event = mission.events.get(i);
             if (!STARTED.equals(event.outcome)) continue;
@@ -622,17 +720,20 @@ public final class MissionStore {
     private static Event event(String kind, String name, String path, String detail,
                                String outcome, boolean requiresReview) {
         return new Event(UUID.randomUUID().toString(), System.currentTimeMillis(), kind,
-                clip(name, 120), path == null ? "" : path, clip(detail, 900), outcome, requiresReview, "", false, false);
+                clip(name, 120), path == null ? "" : path, clip(detail, 900), outcome, requiresReview, "", "", false, false);
     }
 
     private static void addEvent(Mission mission, Event event) {
         mission.events.add(event);
         if (mission.events.size() <= RECENT_EVENTS) return;
         HashSet<String> changedPaths = new HashSet<>();
+        HashSet<String> failurePaths = new HashSet<>();
         for (int i = mission.events.size() - 1; i >= 0; i--) {
             Event candidate = mission.events.get(i);
             boolean latestChange = candidate.changed && changedPaths.add(candidate.path);
-            if (i >= mission.events.size() - RECENT_EVENTS || latestChange) continue;
+            boolean latestFailure = FAILED.equals(candidate.outcome) && failurePaths.size() < CONTEXT_EVENTS
+                    && failurePaths.add(candidate.name + '\n' + candidate.path);
+            if (i >= mission.events.size() - RECENT_EVENTS || latestChange || latestFailure) continue;
             if (STARTED.equals(candidate.outcome)
                     || (candidate.requiresReview && UNKNOWN.equals(candidate.outcome) && !candidate.acknowledged)) continue;
             mission.events.remove(i);
@@ -659,6 +760,62 @@ public final class MissionStore {
         update.apply(mission);
         mission.updated = System.currentTimeMillis();
         replace(index, mission);
+    }
+
+    public synchronized void selectProject(String projectId) {
+        updateActive(mission -> mission.projectId = projectId);
+    }
+
+    public synchronized void recordPhase(String name, String outcome) {
+        updateActive(mission -> recordPhase(mission, name, outcome));
+    }
+
+    public synchronized void pendingDiagnostic(String id) {
+        updateActive(mission -> mission.pendingDiagnosticId = id);
+    }
+
+    public synchronized boolean recordDiagnostic(String id, long checkStarted, String outcome) {
+        int index = indexOf(activeId);
+        if (index < 0) return false;
+        boolean current = checkStarted >= missions.get(index).lastProjectChange;
+        updateActive(mission -> {
+            if (mission.pendingDiagnosticId.equals(id)) mission.pendingDiagnosticId = "";
+            if (current) {
+                mission.diagnosticCompleted = SUCCEEDED.equals(outcome) || FAILED.equals(outcome);
+                recordPhase(mission, VERIFICATION, outcome);
+            }
+        });
+        return current;
+    }
+
+    private static void recordPhase(Mission mission, String name, String outcome) {
+        if (!mission.developerMode || !mission.phaseStatus.containsKey(name)) return;
+        if (name.equals(mission.phase) && outcome.equals(mission.phaseStatus.get(name))) return;
+        mission.phase = name;
+        mission.phaseStatus.put(name, outcome);
+        addEvent(mission, event("phase", name, "", "", outcome, false));
+    }
+
+    /** Stores the developer plan before the first write or executable check. */
+    public synchronized String plan(JSONObject params) {
+        Mission active = active();
+        if (active == null || !active.developerMode) return "Для плана требуется активная задача разработчика.";
+        String analysis = params.optString("analysis").trim();
+        String plan = params.optString("plan").trim();
+        if (analysis.isEmpty() || plan.isEmpty()) return "Укажите результат анализа и технический план.";
+        String deliverable = params.optString("deliverable", "analysis");
+        switch (deliverable) {
+            case "analysis": case "project": case "github_commit": case "diagnostics": break;
+            default: return "Выберите тип результата: analysis, project, github_commit или diagnostics.";
+        }
+        updateActive(mission -> {
+            mission.analysis = clip(analysis, 4_000);
+            mission.plan = clip(plan, 8_000);
+            mission.deliverable = deliverable;
+            recordPhase(mission, ANALYSIS, SUCCEEDED);
+            recordPhase(mission, PLAN, SUCCEEDED);
+        });
+        return "Технический план сохранён.";
     }
 
     /** A descriptive checkpoint supplied by the model. */
@@ -706,6 +863,11 @@ public final class MissionStore {
     }
 
     public synchronized void finishAction(String actionId, String outcome, String detail, boolean changed, String patch) {
+        finishAction(actionId, outcome, detail, changed, patch, "");
+    }
+
+    public synchronized void finishAction(String actionId, String outcome, String detail, boolean changed,
+                                          String patch, String reason) {
         if (actionId == null || actionId.isEmpty()) return;
         switch (outcome) {
             case SUCCEEDED: case FAILED: case DENIED: case UNKNOWN: case INTERRUPTED:
@@ -718,8 +880,34 @@ public final class MissionStore {
                 if (!event.id.equals(actionId) || !STARTED.equals(event.outcome)) continue;
                 String preview = clip(patch, 24_000);
                 if (patch != null && patch.length() > 24_000) preview += "\n[Дальнейшие строки не сохранены]";
-                mission.events.set(i, event.completed(outcome, clip(detail, 900), preview, changed));
-                if (FAILED.equals(outcome)) increment(mission.errorCounts, "Инструмент · " + event.name);
+                mission.events.set(i, event.completed(outcome, clip(detail, 900), preview, clip(reason, 1_200), changed));
+                if (SUCCEEDED.equals(outcome) && !event.name.startsWith("mission_")) {
+                    mission.completedActions++;
+                    if (mission.developerMode) {
+                        switch (event.name) {
+                            case "project_create": mission.projectCreated = true; break;
+                            case "project_write": case "project_edit": case "project_delete": case "project_import":
+                                mission.projectFilesChanged |= changed;
+                                if (changed) {
+                                    mission.diagnosticCompleted = false;
+                                    mission.lastProjectChange = System.currentTimeMillis();
+                                    mission.phaseStatus.put(VERIFICATION, WAITING);
+                                }
+                                break;
+                            case "github_commit_changes":
+                                mission.githubCommitPublished = true;
+                                mission.phaseStatus.put(VERIFICATION, WAITING);
+                                break;
+                            default: break;
+                        }
+                    }
+                }
+                if (DENIED.equals(outcome)) mission.deniedActions++;
+                if (FAILED.equals(outcome)) {
+                    mission.failedActions++;
+                    mission.error = clip(detail, 1_800);
+                    increment(mission.errorCounts, "Инструмент · " + event.name);
+                }
                 if (event.requiresReview && UNKNOWN.equals(outcome)) mission.reviewRequired = true;
                 if (changed && !event.path.isEmpty() && !mission.changedFiles.contains(event.path)) {
                     mission.changedFiles.add(event.path);
@@ -799,6 +987,7 @@ public final class MissionStore {
         mission.updated = System.currentTimeMillis();
         mission.status = status;
         if (REVIEW.equals(status)) mission.reviewRequired = true;
+        mission.phaseStatus.replaceAll((name, outcome) -> STARTED.equals(outcome) ? INTERRUPTED : outcome);
         addEvent(mission, event("state", status, "", "", "", false));
     }
 
