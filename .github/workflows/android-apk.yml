@@ -2,7 +2,7 @@ name: Android APK
 
 on:
   push:
-    branches: [main, feature/kent-0.8-autonomous-developer]
+    branches: [main, feature/kent-0.8-autonomous-developer, feature/kent-0.9-headless-termux]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -119,7 +119,9 @@ jobs:
   sign-tested-apk:
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.stable_signing &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/kent-0.8-autonomous-developer')
+      (github.ref == 'refs/heads/main' ||
+       github.ref == 'refs/heads/feature/kent-0.8-autonomous-developer' ||
+       github.ref == 'refs/heads/feature/kent-0.9-headless-termux')
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
