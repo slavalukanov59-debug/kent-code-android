@@ -2,9 +2,11 @@ package ai.kent.code;
 
 import android.app.Activity;
 import android.app.PendingIntent;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -31,6 +33,8 @@ public final class TermuxBridge {
     private static final String HOME = "/data/data/com.termux/files/home";
     private static final String BASH = "/data/data/com.termux/files/usr/bin/bash";
     private static final String TERMUX_PACKAGE = "com.termux";
+    private static final ComponentName RUN_COMMAND_SERVICE = new ComponentName(
+            TERMUX_PACKAGE, "com.termux.app.RunCommandService");
     private static final int MAX_OUTPUT = 16000;
     private static final String SELECT_DIRECTORY =
             "cd -P -- \"$HOME\" || exit 125\n" +
@@ -62,6 +66,32 @@ public final class TermuxBridge {
         volatile CommandResult result;
     }
 
+    interface BackgroundStart extends AutoCloseable {
+        CommandResult completed();
+        @Override void close();
+    }
+
+    private static final class ServiceRequest implements BackgroundStart {
+        final String id;
+        final Pending pending;
+        final PendingIntent callback;
+        final Intent intent;
+
+        ServiceRequest(String id, Pending pending, PendingIntent callback, Intent intent) {
+            this.id = id;
+            this.pending = pending;
+            this.callback = callback;
+            this.intent = intent;
+        }
+
+        @Override public CommandResult completed() { return pending.result; }
+
+        @Override public void close() {
+            ACTIVE.remove(id, pending);
+            callback.cancel();
+        }
+    }
+
     private final Context context;
 
     public TermuxBridge(Context context) {
@@ -78,6 +108,30 @@ public final class TermuxBridge {
             return true;
         } catch (PackageManager.NameNotFoundException missing) {
             return false;
+        }
+    }
+
+    boolean runCommandAvailable() {
+        try {
+            ServiceInfo info = context.getPackageManager().getServiceInfo(RUN_COMMAND_SERVICE, 0);
+            return info.exported && info.enabled && info.applicationInfo.enabled && PERMISSION.equals(info.permission);
+        } catch (PackageManager.NameNotFoundException | SecurityException missing) {
+            return false;
+        }
+    }
+
+    /** Caller checks consent for the fixed helper and keeps a visible Activity. */
+    BackgroundStart startLocalBridge(BooleanSupplier cancelled) throws IOException {
+        if (!runCommandAvailable()) throw new IOException("Эта установка Termux не предоставляет RUN_COMMAND.");
+        if (!hasPermission()) throw new IOException("Выдайте Kent Code разрешение RUN_COMMAND в Android.");
+        String[] arguments = {"-I", "-u", ".kent-bridge/server.py"};
+        ServiceRequest request = request(PREFIX_BIN + "python3", arguments, "KENT · Локальный мост");
+        try {
+            start(request, cancelled);
+            return request;
+        } catch (IOException | RuntimeException failure) {
+            request.close();
+            throw failure;
         }
     }
 
@@ -121,37 +175,20 @@ public final class TermuxBridge {
     private CommandResult dispatch(String[] arguments, boolean adb, int timeout,
                                    BooleanSupplier cancelled) throws IOException {
         if (!hasPermission())
-            return CommandResult.rejected("Выдай KENT CODE разрешение RUN_COMMAND в настройках Android.");
+            return CommandResult.rejected("Выдайте Kent Code разрешение RUN_COMMAND в Android.");
         if (CommandResult.cancelled(cancelled))
             return CommandResult.stopped(CommandResult.Status.CANCELLED, "Запуск отменён до отправки.", false);
-        // A result delivered after process restart must never match a newer request.
-        Uri requestId = Uri.fromParts("kent-termux-result", UUID.randomUUID().toString(), null);
-        String id = requestId.toString();
-        Pending pending = new Pending();
-
-        Intent callback = new Intent(context, TermuxResultReceiver.class).setData(requestId);
-        int flags = PendingIntent.FLAG_ONE_SHOT;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) flags |= PendingIntent.FLAG_MUTABLE;
-        PendingIntent pi = PendingIntent.getBroadcast(context, 0, callback, flags);
-
-        Intent request = new Intent("com.termux.RUN_COMMAND");
-        request.setClassName(TERMUX_PACKAGE, "com.termux.app.RunCommandService");
-        request.putExtra("com.termux.RUN_COMMAND_PATH", BASH);
-        request.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arguments);
-        request.putExtra("com.termux.RUN_COMMAND_WORKDIR", HOME);
-        request.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
-        request.putExtra("com.termux.RUN_COMMAND_COMMAND_LABEL", adb ? "KENT · Shizuku ADB" : "KENT · Termux");
-        request.putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", pi);
-
-        ACTIVE.put(id, pending);
-        try {
-            if (CommandResult.cancelled(cancelled))
-                return CommandResult.stopped(CommandResult.Status.CANCELLED, "Запуск отменён до отправки.", false);
-            if (context.startService(request) == null)
-                return CommandResult.rejected("Служба Termux не найдена. Проверь установку и разрешение внешних команд.");
+        try (ServiceRequest request = request(BASH, arguments, adb ? "KENT · Shizuku ADB" : "KENT · Termux")) {
+            try {
+                start(request, cancelled);
+            } catch (IOException failure) {
+                if (CommandResult.cancelled(cancelled))
+                    return CommandResult.stopped(CommandResult.Status.CANCELLED, "Запуск отменён до отправки.", false);
+                return CommandResult.rejected(failure.getMessage());
+            }
             long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeout);
             while (true) {
-                if (pending.done.await(200, TimeUnit.MILLISECONDS)) return pending.result;
+                if (request.pending.done.await(200, TimeUnit.MILLISECONDS)) return request.completed();
                 if (CommandResult.cancelled(cancelled))
                     return CommandResult.stopped(CommandResult.Status.CANCELLED, "Официальный мост прекращает ожидание.", true);
                 if (System.nanoTime() >= end)
@@ -160,13 +197,39 @@ public final class TermuxBridge {
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             return CommandResult.stopped(CommandResult.Status.CANCELLED, "Ожидание прервано.", true);
+        }
+    }
+
+    private ServiceRequest request(String executable, String[] arguments, String label) {
+        // A callback from a previous process must never match a newer request.
+        Uri requestId = Uri.fromParts("kent-termux-result", UUID.randomUUID().toString(), null);
+        String id = requestId.toString();
+        Pending pending = new Pending();
+        Intent callback = new Intent(context, TermuxResultReceiver.class).setData(requestId);
+        int flags = PendingIntent.FLAG_ONE_SHOT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) flags |= PendingIntent.FLAG_MUTABLE;
+        PendingIntent pi = PendingIntent.getBroadcast(context, 0, callback, flags);
+
+        Intent request = new Intent("com.termux.RUN_COMMAND").setComponent(RUN_COMMAND_SERVICE);
+        request.putExtra("com.termux.RUN_COMMAND_PATH", executable);
+        request.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arguments);
+        request.putExtra("com.termux.RUN_COMMAND_WORKDIR", HOME);
+        request.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
+        request.putExtra("com.termux.RUN_COMMAND_COMMAND_LABEL", label);
+        request.putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", pi);
+        ACTIVE.put(id, pending);
+        return new ServiceRequest(id, pending, pi, request);
+    }
+
+    private void start(ServiceRequest request, BooleanSupplier cancelled) throws IOException {
+        try {
+            if (CommandResult.cancelled(cancelled)) throw new IOException("Запуск отменён до отправки.");
+            if (context.startService(request.intent) == null)
+                throw new IOException("Служба Termux RUN_COMMAND недоступна в этой установке.");
         } catch (SecurityException ex) {
-            return CommandResult.rejected("Termux отклонил доступ. Проверь RUN_COMMAND и allow-external-apps=true.");
+            throw new IOException("Android отклонил доступ к RUN_COMMAND. Проверьте разрешение приложения.", ex);
         } catch (IllegalStateException ex) {
-            return CommandResult.rejected("Android не запустил службу Termux. Открой Termux и KENT CODE на экране.");
-        } finally {
-            ACTIVE.remove(id);
-            pi.cancel();
+            throw new IOException("Android не разрешил запуск службы Termux. Повторите из открытого Kent Code или запустите мост вручную.", ex);
         }
     }
 
