@@ -78,6 +78,15 @@ def read_signed(sock, key, client_nonce, server_nonce):
     return json.loads(frame[32:])
 
 
+def health(key, **fields):
+    payload = json.dumps(dict(mode="health", **fields)).encode()
+    with socket.create_connection(ADDRESS, timeout=5) as sock:
+        client_nonce, server_nonce, legit = challenge(sock, key)
+        assert legit
+        write_frame(sock, signature(key, b"request", client_nonce, server_nonce, payload) + payload)
+        return read_signed(sock, key, client_nonce, server_nonce)
+
+
 def snapshot(files):
     data = BytesIO()
     with zipfile.ZipFile(data, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -118,7 +127,8 @@ def developer(key, program, check, inputs, archive=None, **options):
 
 with tempfile.TemporaryDirectory() as tmp:
     home = Path(tmp)
-    start = "import sys; from pathlib import Path; from tools.kent_bridge_server import main; main(Path(sys.argv[1]), sys.argv[2])"
+    start = ("import sys; from pathlib import Path; from tools.kent_bridge_server import main; "
+             "sys.exit(main(Path(sys.argv[1]), sys.argv[2]))")
     server = subprocess.Popen([sys.executable, "-u", "-B", "-c", start, tmp, shutil.which("bash")],
                               cwd=BASE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
@@ -137,8 +147,23 @@ with tempfile.TemporaryDirectory() as tmp:
         assert len(token) == 48
         assert (token_file.stat().st_mode & 0o777) == 0o600
 
-        # Sending a previously used signed command with a fresh challenge must fail.
         marker = home / "approved-run"
+        assert health(token, healthVersion=1) == dict(status="healthy", healthVersion=1)
+        for unsupported in (True, 2, "1"):
+            assert health(token, healthVersion=unsupported)["status"] == "rejected"
+        unexpected = health(token, healthVersion=1, command="touch approved-run", workDir=".", timeout=5)
+        assert unexpected["status"] == "rejected" and not marker.exists(), unexpected
+        assert not list((home / ".kent-bridge").glob("check-*"))
+
+        duplicate_home = home / "other-home"
+        duplicate_home.mkdir()
+        duplicate = subprocess.run([sys.executable, "-u", "-B", "-c", start, str(duplicate_home), shutil.which("bash")],
+                                   cwd=BASE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        assert duplicate.returncode == 0 and not duplicate.stderr, duplicate
+        assert token not in duplicate.stdout and not list(duplicate_home.iterdir())
+        assert health(token, healthVersion=1)["status"] == "healthy"
+
+        # Sending a previously used signed command with a fresh challenge must fail.
         success, signed_request = ask(token, "touch approved-run && printf 'КЕНТ_OK,%s' \"a'b\"")
         assert success == dict(status="exited", exitCode=0, detached=False, output="КЕНТ_OK,a'b"), success
         assert marker.exists()
@@ -244,6 +269,7 @@ class CancellationTest(unittest.TestCase):
                     break
                 time.sleep(0.05)
             assert started.exists(), "The test command never started"
+            assert health(token, healthVersion=1)["status"] == "healthy"
             write_frame(sock, signature(token, b"cancel", *nonces))
             result = read_signed(sock, token, *nonces)
             assert result["status"] == "cancelled" and result["exitCode"] is not None and not result["detached"], result
@@ -256,12 +282,12 @@ class CancellationTest(unittest.TestCase):
         assert not late.exists()
         assert not list((home / ".kent-bridge").glob("check-*"))
 
-        print("PASS: Termux authentication, replay rejection, cwd, argv policy, snapshot integrity, "
-              "separate output, compilation, timeout, and process-group cancellation")
+        print("PASS: Termux readiness while busy, duplicate startup, authentication, replay rejection, "
+              "cwd, argv policy, snapshot integrity, separate output, compilation, timeout, and cancellation")
     finally:
         server.terminate()
         server.wait(timeout=5)
         output, errors = server.communicate()
         if "token" in locals():
-            assert token not in output
+            assert token not in output and token not in errors
         assert not errors, errors

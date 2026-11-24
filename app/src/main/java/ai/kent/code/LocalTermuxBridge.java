@@ -8,6 +8,7 @@ import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -37,6 +38,10 @@ public final class LocalTermuxBridge {
     static final long MAX_ARCHIVE_BYTES = 64L * 1024 * 1024;
     static final long MAX_SNAPSHOT_BYTES = 512L * 1024 * 1024;
     private static final byte[] HELLO = "KENT-BRIDGE-2".getBytes(StandardCharsets.US_ASCII);
+    // Deliberately carries no command, even when received by an older server.
+    private static final byte[] HEALTH_REQUEST =
+            "{\"mode\":\"health\",\"healthVersion\":1}".getBytes(StandardCharsets.US_ASCII);
+    private static final InetSocketAddress LOOPBACK = new InetSocketAddress("127.0.0.1", PORT);
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final ScheduledThreadPoolExecutor WATCHDOG = watchdog();
     private final SecureKeyStore secrets;
@@ -46,6 +51,80 @@ public final class LocalTermuxBridge {
     public boolean configured() {
         try { return validToken(secrets.bridgeToken()); }
         catch (Exception ignored) { return false; }
+    }
+
+    public static final class Health {
+        public enum Status { READY, OFFLINE, TIMEOUT, AUTH_FAILED, LEGACY, INCOMPATIBLE, UNAVAILABLE, CANCELLED, UNCONFIGURED }
+
+        public final Status status;
+        public final String detail;
+
+        Health(Status status, String detail) {
+            this.status = status;
+            this.detail = detail;
+        }
+    }
+
+    /** Verifies the running loopback server without starting a process or sending code. */
+    public Health probe(BooleanSupplier cancelled) {
+        if (CommandResult.cancelled(cancelled)) return healthCancelled();
+        String token;
+        try {
+            token = secrets.bridgeToken();
+        } catch (Exception unavailable) {
+            return new Health(Health.Status.UNCONFIGURED, "Не удалось прочитать токен моста из защищённого хранилища.");
+        }
+        return probe(LOOPBACK, token, cancelled);
+    }
+
+    static Health probe(InetSocketAddress endpoint, String token, BooleanSupplier cancelled) {
+        if (CommandResult.cancelled(cancelled)) return healthCancelled();
+        if (!validToken(token))
+            return new Health(Health.Status.UNCONFIGURED, "Добавьте токен локального моста из 48 символов.");
+        try (Socket socket = new Socket()) {
+            socket.connect(endpoint, 3000);
+            Session session = authenticate(socket, token, cancelled);
+            checkCancelled(cancelled);
+            session.request(HEALTH_REQUEST);
+            byte[] reply = session.readSigned(deadline(3), () -> checkCancelled(cancelled));
+            JSONObject response = new JSONObject(new String(reply, StandardCharsets.UTF_8));
+            if ("healthy".equals(response.optString("status")) && Integer.valueOf(1).equals(response.opt("healthVersion")))
+                return new Health(Health.Status.READY, "Подлинность и готовность локального моста подтверждены.");
+            if ("rejected".equals(response.optString("status")) &&
+                    "Недопустимая команда или таймаут.".equals(response.optString("message")))
+                return new Health(Health.Status.LEGACY, "Работает прежняя версия моста. Для автоподключения обновите сервер до 0.9.");
+            return incompatible();
+        } catch (BridgeCancelled stopped) {
+            return healthCancelled();
+        } catch (BridgeAuthenticationFailed | GeneralSecurityException invalid) {
+            if (CommandResult.cancelled(cancelled)) return healthCancelled();
+            return new Health(Health.Status.AUTH_FAILED, "Подлинность моста не подтверждена. Сверьте токен в настройках.");
+        } catch (BridgeProtocolMismatch | EOFException | JSONException invalid) {
+            return CommandResult.cancelled(cancelled) ? healthCancelled() : incompatible();
+        } catch (ConnectException unavailable) {
+            if (CommandResult.cancelled(cancelled)) return healthCancelled();
+            String reason = unavailable.getMessage();
+            if (reason != null && (reason.contains("ECONNREFUSED") || reason.contains("Connection refused")))
+                return new Health(Health.Status.OFFLINE, "Локальный мост не принимает подключения.");
+            return healthUnavailable();
+        } catch (SocketTimeoutException timeout) {
+            if (CommandResult.cancelled(cancelled)) return healthCancelled();
+            return new Health(Health.Status.TIMEOUT, "Истекло время ожидания ответа локального моста.");
+        } catch (IOException unavailable) {
+            return CommandResult.cancelled(cancelled) ? healthCancelled() : healthUnavailable();
+        }
+    }
+
+    private static Health healthCancelled() {
+        return new Health(Health.Status.CANCELLED, "Проверка локального моста отменена.");
+    }
+
+    private static Health healthUnavailable() {
+        return new Health(Health.Status.UNAVAILABLE, "Не удалось установить или сохранить соединение с локальным мостом.");
+    }
+
+    private static Health incompatible() {
+        return new Health(Health.Status.INCOMPATIBLE, "Мост не подтвердил протокол готовности. Обновите сервер до версии 0.9.");
     }
 
     public String run(String command, boolean adb, int requestedSeconds, BooleanSupplier cancelled) throws IOException {
@@ -94,55 +173,43 @@ public final class LocalTermuxBridge {
         if (CommandResult.cancelled(cancelled)) return cancelledResult(false);
         boolean dispatched = false;
         try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress("127.0.0.1", PORT), 3000);
-            socket.setSoTimeout(250);
-            DataInputStream in = new DataInputStream(socket.getInputStream());
-            DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-
-            byte[] clientNonce = new byte[NONCE_BYTES];
-            RANDOM.nextBytes(clientNonce);
-            writeFrame(out, join(HELLO, clientNonce));
-            long helloDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
-            byte[] challenge = readFrame(in, helloDeadline, () -> checkCancelled(cancelled), NONCE_BYTES + MAC_BYTES);
-            if (challenge.length != NONCE_BYTES + MAC_BYTES)
-                return CommandResult.rejected("Обнови и перезапусти tools/kent_bridge_server.py в Termux.");
-            byte[] serverNonce = Arrays.copyOf(challenge, NONCE_BYTES);
-            byte[] proof = Arrays.copyOfRange(challenge, NONCE_BYTES, challenge.length);
-            byte[] key = token.getBytes(StandardCharsets.US_ASCII);
-            if (!MessageDigest.isEqual(proof, signature(key, "server", clientNonce, serverNonce, new byte[0])))
-                return CommandResult.rejected("Мост не подтвердил подлинность. Сверь токен и перезапусти сервер Termux.");
+            socket.connect(LOOPBACK, 3000);
+            Session session = authenticate(socket, token, cancelled);
 
             byte[] payload = request.toString().getBytes(StandardCharsets.UTF_8);
             if (payload.length > MAX_REQUEST - MAC_BYTES)
                 return CommandResult.rejected("Параметры проверки превышают размер запроса к мосту.");
-            byte[] signedRequest = join(signature(key, "request", clientNonce, serverNonce, payload), payload);
             if (CommandResult.cancelled(cancelled)) return cancelledResult(false);
             dispatched = snapshot == null;
-            writeFrame(out, signedRequest);
+            session.request(payload);
             if (snapshot != null) {
-                byte[] initial = verifiedReply(readFrame(in, System.nanoTime() + TimeUnit.SECONDS.toNanos(5),
-                        () -> checkCancelled(cancelled), MAX_REPLY), key, clientNonce, serverNonce);
+                byte[] initial = session.readSigned(deadline(5), () -> checkCancelled(cancelled));
                 if (!"ready".equals(new JSONObject(new String(initial, StandardCharsets.UTF_8)).getString("status")))
                     return developerResult(initial);
                 dispatched = true;
-                upload(snapshot, out, socket, cancelled);
+                upload(snapshot, session.out, socket, cancelled);
             }
-            long responseDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds + (snapshot == null ? 8L : 128L));
-            byte[] cancelProof = signature(key, "cancel", clientNonce, serverNonce, new byte[0]);
+            long responseDeadline = deadline(seconds + (snapshot == null ? 8L : 128L));
+            byte[] cancelProof = session.signature("cancel", new byte[0]);
             long[] cancellationSent = {0};
             ReadCheck check = developer ? () -> {
                 if (!CommandResult.cancelled(cancelled)) return;
                 if (cancellationSent[0] == 0) {
                     cancellationSent[0] = System.nanoTime();
-                    writeFrame(out, cancelProof);
+                    writeFrame(session.out, cancelProof);
                 } else if (System.nanoTime() - cancellationSent[0] > TimeUnit.SECONDS.toNanos(8)) {
                     throw new BridgeCancelled();
                 }
             } : () -> checkCancelled(cancelled);
-            byte[] response = verifiedReply(readFrame(in, responseDeadline, check, MAX_REPLY), key, clientNonce, serverNonce);
+            byte[] response = session.readSigned(responseDeadline, check);
             return developer ? developerResult(response) : decode(response, adb);
         } catch (BridgeCancelled ignored) {
             return cancelledResult(dispatched);
+        } catch (BridgeAuthenticationFailed invalid) {
+            if (CommandResult.cancelled(cancelled)) return cancelledResult(dispatched);
+            return dispatched ? CommandResult.stopped(CommandResult.Status.UNKNOWN,
+                    "Подпись результата проверки не подтверждена.", true)
+                    : CommandResult.rejected("Мост не подтвердил подлинность. Сверь токен и перезапусти сервер Termux.");
         } catch (SocketTimeoutException ignored) {
             if (CommandResult.cancelled(cancelled)) return cancelledResult(dispatched);
             return dispatched ? CommandResult.stopped(CommandResult.Status.TIMED_OUT, "Мост не вернул ответ вовремя.", true)
@@ -154,14 +221,59 @@ public final class LocalTermuxBridge {
         }
     }
 
-    private static byte[] verifiedReply(byte[] response, byte[] key, byte[] clientNonce, byte[] serverNonce)
+    private static Session authenticate(Socket socket, String token, BooleanSupplier cancelled)
             throws IOException, GeneralSecurityException {
-        if (response.length <= MAC_BYTES) throw new IOException("Неполный ответ моста");
-        byte[] responseMac = Arrays.copyOf(response, MAC_BYTES);
-        byte[] payload = Arrays.copyOfRange(response, MAC_BYTES, response.length);
-        if (!MessageDigest.isEqual(responseMac, signature(key, "response", clientNonce, serverNonce, payload)))
-            throw new IOException("Подпись ответа моста не подтверждена");
-        return payload;
+        checkCancelled(cancelled);
+        socket.setSoTimeout(250);
+        DataInputStream in = new DataInputStream(socket.getInputStream());
+        DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+        byte[] clientNonce = new byte[NONCE_BYTES];
+        RANDOM.nextBytes(clientNonce);
+        writeFrame(out, join(HELLO, clientNonce));
+        byte[] challenge = readFrame(in, deadline(3), () -> checkCancelled(cancelled), NONCE_BYTES + MAC_BYTES);
+        if (challenge.length != NONCE_BYTES + MAC_BYTES) throw new BridgeProtocolMismatch();
+        byte[] serverNonce = Arrays.copyOf(challenge, NONCE_BYTES);
+        byte[] proof = Arrays.copyOfRange(challenge, NONCE_BYTES, challenge.length);
+        Session session = new Session(in, out, token.getBytes(StandardCharsets.US_ASCII), clientNonce, serverNonce);
+        if (!MessageDigest.isEqual(proof, session.signature("server", new byte[0]))) throw new BridgeAuthenticationFailed();
+        return session;
+    }
+
+    private static long deadline(long seconds) {
+        return System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+    }
+
+    private static final class Session {
+        final DataInputStream in;
+        final DataOutputStream out;
+        final byte[] key;
+        final byte[] clientNonce;
+        final byte[] serverNonce;
+
+        Session(DataInputStream in, DataOutputStream out, byte[] key, byte[] clientNonce, byte[] serverNonce) {
+            this.in = in;
+            this.out = out;
+            this.key = key;
+            this.clientNonce = clientNonce;
+            this.serverNonce = serverNonce;
+        }
+
+        byte[] signature(String label, byte[] payload) throws GeneralSecurityException {
+            return LocalTermuxBridge.signature(key, label, clientNonce, serverNonce, payload);
+        }
+
+        void request(byte[] payload) throws IOException, GeneralSecurityException {
+            writeFrame(out, join(signature("request", payload), payload));
+        }
+
+        byte[] readSigned(long deadline, ReadCheck check) throws IOException, GeneralSecurityException {
+            byte[] response = readFrame(in, deadline, check, MAX_REPLY);
+            if (response.length <= MAC_BYTES) throw new BridgeProtocolMismatch();
+            byte[] proof = Arrays.copyOf(response, MAC_BYTES);
+            byte[] payload = Arrays.copyOfRange(response, MAC_BYTES, response.length);
+            if (!MessageDigest.isEqual(proof, signature("response", payload))) throw new BridgeAuthenticationFailed();
+            return payload;
+        }
     }
 
     private static ScheduledThreadPoolExecutor watchdog() {
@@ -258,7 +370,7 @@ public final class LocalTermuxBridge {
         byte[] header = new byte[4];
         readExact(in, header, deadline, check);
         int size = ByteBuffer.wrap(header).getInt();
-        if (size < 1 || size > limit) throw new IOException("Недопустимый размер ответа моста");
+        if (size < 1 || size > limit) throw new BridgeProtocolMismatch();
         byte[] frame = new byte[size];
         readExact(in, frame, deadline, check);
         return frame;
@@ -297,6 +409,14 @@ public final class LocalTermuxBridge {
     }
 
     private static final class BridgeCancelled extends IOException {
+        private static final long serialVersionUID = 1L;
+    }
+
+    private static final class BridgeAuthenticationFailed extends IOException {
+        private static final long serialVersionUID = 1L;
+    }
+
+    private static final class BridgeProtocolMismatch extends IOException {
         private static final long serialVersionUID = 1L;
     }
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Manually started, mutually authenticated loopback bridge for Termux."""
+"""Mutually authenticated loopback bridge for Termux."""
+import errno
 import hmac
 import hashlib
 import json
@@ -14,6 +15,7 @@ import socketserver
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -518,7 +520,14 @@ class Handler(socketserver.BaseRequestHandler):
                 send_frame(sock, signature(token, b"response", client_nonce, server_nonce, result) + result)
 
             decoded = json.loads(payload.decode("utf-8"))
-            if isinstance(decoded, dict) and decoded.get("mode") == "developer":
+            mode = decoded.get("mode") if isinstance(decoded, dict) else None
+            if mode == "health":
+                if set(decoded) == {"mode", "healthVersion"} and type(decoded["healthVersion"]) is int \
+                        and decoded["healthVersion"] == 1:
+                    respond({"status": "healthy", "healthVersion": 1})
+                else:
+                    respond(reject("Версия проверки готовности моста не поддерживается."))
+            elif mode == "developer":
                 cancel_proof = signature(token, b"cancel", client_nonce, server_nonce)
                 respond(run_developer(self.server.home, self.server.bash, decoded, sock, cancel_proof,
                                       lambda: respond({"status": "ready"})))
@@ -536,9 +545,14 @@ class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def __init__(self, home, bash):
         self.home = home.resolve()
         self.bash = bash
-        self.token = load_token(self.home)
         self.slots = threading.BoundedSemaphore(16)
+        # Binding first prevents duplicate launches racing token creation or touching a running bridge's files.
         super().__init__((HOST, PORT), Handler)
+        try:
+            self.token = load_token(self.home)
+        except Exception:
+            self.server_close()
+            raise
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
@@ -558,14 +572,27 @@ class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def main(home, bash):
-    with Server(home, bash) as server:
-        print("KENT BRIDGE 0.8 · 127.0.0.1:%s" % PORT, flush=True)
-        print("Файл токена: ~/.kent-bridge/token. Остановить мост: Ctrl+C.", flush=True)
+    try:
+        server = Server(home, bash)
+    except OSError as error:
+        if error.errno == errno.EADDRINUSE:
+            print(f"Порт {HOST}:{PORT} уже занят. Проверьте состояние моста в KENT CODE.", flush=True)
+            return 0
+        print("KENT BRIDGE не запущен. Проверьте права Termux и папку установки.", file=sys.stderr, flush=True)
+        return 1
+    except RuntimeError:
+        print("KENT BRIDGE не запущен. Проверьте файл токена и папку установки.", file=sys.stderr, flush=True)
+        return 1
+    with server:
+        print(f"KENT BRIDGE 0.9 · {HOST}:{PORT}", flush=True)
+        if sys.stdout.isatty():
+            print("Файл токена: ~/.kent-bridge/token. Остановить мост: Ctrl+C.", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+    return 0
 
 
 if __name__ == "__main__":
-    main(Path.home(), Path(os.environ.get("PREFIX", "/data/data/com.termux/files/usr")) / "bin" / "bash")
+    raise SystemExit(main(Path.home(), Path(os.environ.get("PREFIX", "/data/data/com.termux/files/usr")) / "bin" / "bash"))
