@@ -3,6 +3,9 @@ package ai.kent.code;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
+import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Color;
@@ -75,6 +78,7 @@ public final class MainActivity extends Activity {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ExecutorService creditExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService workspaceBrowserExecutor = Executors.newFixedThreadPool(2);
+    private final ExecutorService termuxUiExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean stopRequested = new AtomicBoolean(false);
     private SafeWorkspace workspace;
     private WorkspaceZipExporter workspaceZipExporter;
@@ -104,6 +108,19 @@ public final class MainActivity extends Activity {
     private boolean missionRefreshQueued;
     private TermuxBridge bridge;
     private LocalTermuxBridge localBridge;
+    private HeadlessTermux headless;
+    private TextView headlessStatusView;
+    private Button headlessRefresh;
+    private Button headlessConnect;
+    private Button headlessPermission;
+    private HeadlessTermux.Status headlessStatus;
+    private String headlessCheckError = "";
+    private Future<?> headlessProbe;
+    private int headlessProbeGeneration;
+    private boolean headlessChecking;
+    private boolean headlessStarting;
+    private ScrollView termuxScroll;
+    private int termuxScrollY;
     private ChatJournal journal;
     private TokenMeter tokenMeter;
     private MissionStore missionStore;
@@ -166,6 +183,7 @@ public final class MainActivity extends Activity {
             projects = data.projects;
             diagnostics = data.diagnostics;
             terminal = data.terminal;
+            headless = data.headless;
             workspaceZipExporter = new WorkspaceZipExporter(workspace);
             bridge = new TermuxBridge(this);
             localBridge = new LocalTermuxBridge(secrets);
@@ -192,6 +210,7 @@ public final class MainActivity extends Activity {
             workspaceDirectory = state.getString("workspace_directory", "");
             workspacePosition = state.getInt("workspace_position");
             workspaceOffset = state.getInt("workspace_offset");
+            termuxScrollY = state.getInt("termux_scroll");
         }
         restoreChatUiState(state);
         draw();
@@ -201,6 +220,7 @@ public final class MainActivity extends Activity {
     @Override protected void onStart() {
         super.onStart();
         foreground = true;
+        if (headless != null) headless.setAppVisible(true);
         if (missionStore != null) {
             if (tab == 4) draw();
             else updateChatRunningState();
@@ -209,6 +229,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onStop() {
         foreground = false;
+        if (headless != null) headless.setAppVisible(false);
         if (activeAgent != null && !stopRequested.get()) requestStop(MissionStore.PAUSED);
         super.onStop();
     }
@@ -222,6 +243,7 @@ public final class MainActivity extends Activity {
         state.putString("workspace_directory", workspaceDirectory);
         state.putInt("workspace_position", workspacePosition);
         state.putInt("workspace_offset", workspaceOffset);
+        state.putInt("termux_scroll", termuxScroll == null ? termuxScrollY : termuxScroll.getScrollY());
         state.putInt("mission_scroll", missionScrollY);
         state.putInt("action_scroll", actionScrollY);
         if (workspaceExport != null) workspaceExport.saveState(state);
@@ -232,6 +254,7 @@ public final class MainActivity extends Activity {
         super.onResume();
         resumed = true;
         onWorkspaceExportChanged();
+        if (termuxPaneVisible() && headless != null) refreshHeadless(false);
     }
 
     @Override protected void onPause() {
@@ -310,6 +333,14 @@ public final class MainActivity extends Activity {
     }
 
     private void draw() {
+        if (termuxScroll != null) termuxScrollY = termuxScroll.getScrollY();
+        termuxScroll = null;
+        if (!termuxPaneVisible()) {
+            headlessStatusView = null;
+            headlessRefresh = null;
+            headlessConnect = null;
+            headlessPermission = null;
+        }
         rememberWorkspacePosition();
         rememberPanelPositions();
         if (workspaceDirectoryTask != null) {
@@ -391,7 +422,7 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams markSpace = new LinearLayout.LayoutParams(dp(7), dp(7));
         markSpace.rightMargin = dp(8);
         head.addView(mark, markSpace);
-        TextView title = text("KENT CODE 0.8", 16, WHITE, true);
+        TextView title = text("KENT CODE 0.9", 16, WHITE, true);
         title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         head.addView(title, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1));
@@ -1404,105 +1435,278 @@ public final class MainActivity extends Activity {
     }
 
 
-    /** Manual opt-in for third-party Termux command bridge. */
+    private boolean termuxPaneVisible() {
+        return tab == 2 && actionPanel == 2;
+    }
+
     private void drawBridge() {
+        boolean opened = headlessStatusView == null;
         ScrollView scroll = new ScrollView(this);
+        termuxScroll = scroll;
         LinearLayout content = vertical();
         content.setPadding(dp(12), dp(9), dp(12), dp(15));
         scroll.addView(content);
         mainArea.addView(scroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
-        padded(content, text("Мост Termux", 16, WHITE, true), 3);
-        padded(content, text("Для сборки Termux из Google Play доступен локальный мост. " +
-                "Диагностику Termux и Shizuku запускает пользователь.", 13, MUTED, false), 5);
+        padded(content, text("Termux", 16, WHITE, true), 3);
+        headlessStatusView = text("", 13, MUTED, false);
+        headlessStatusView.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        padded(content, headlessStatusView, 8);
 
-        padded(content, text(bridge.hasPermission()
-                ? "● Разрешение RUN_COMMAND: выдано"
-                : "○ Разрешение RUN_COMMAND: не выдано", 13,
-                bridge.hasPermission() ? GREEN : GOLD, true), 20);
+        LinearLayout connection = new LinearLayout(this);
+        headlessRefresh = button("Проверить", false);
+        headlessConnect = button("Подключить", true);
+        addTermuxControl(connection, headlessRefresh);
+        addTermuxControl(connection, headlessConnect);
+        headlessRefresh.setOnClickListener(view -> refreshHeadless(false));
+        headlessConnect.setOnClickListener(view -> requestHeadlessConnection());
+        padded(content, connection, 6);
 
-        Button permission = button("Выдать разрешение Termux", true);
-        padded(content, permission, 10);
-        permission.setOnClickListener(v -> {
-            if (bridge.hasPermission()) { toast("Разрешение уже выдано"); return; }
+        Button setup = button("Настроить Termux", false);
+        setup.setOnClickListener(view -> showTermuxSetup());
+        padded(content, setup, 8);
+        headlessPermission = button("Выдать RUN_COMMAND", false);
+        headlessPermission.setOnClickListener(view -> {
+            if (!bridge.installed()) {
+                toast("Android не обнаружил Termux.");
+                return;
+            }
             requestPermissions(new String[]{TermuxBridge.PERMISSION}, 403);
         });
-        padded(content, text("Если Android не покажет запрос: Настройки → Приложения → KENT CODE RED → " +
-                "Разрешения → Дополнительные разрешения → Run commands in Termux environment.", 12, MUTED, false), 7);
+        padded(content, headlessPermission, 6);
 
-        padded(content, text("Разрешение внешних команд в Termux", 13, WHITE, true), 18);
-        padded(content, text("mkdir -p ~/.termux\n" +
-                "printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties\n" +
-                "termux-reload-settings", 12, GREEN, false), 7);
-        padded(content, text("Используется официальный RUN_COMMAND Intent (Termux >= 0.109). " +
-                "Shizuku должен быть запущен, а ~/rish и ~/rish_shizuku.dex уже настроены. " +
-                "Если Android блокирует запуск, открой Termux на экране и разреши фоновую работу.", 12, MUTED, false), 10);
-
-        padded(content, text("Локальный мост для Termux", 15, WHITE, true), 20);
-        padded(content, text("Для сборок без RUN_COMMAND запустите локальный сервер в Termux.", 12,
-                MUTED, false), 7);
-        padded(content, text("cd ~/KENT-CODE-Android\n" +
-                "git pull --ff-only\n" +
-                "pkg install python -y\n" +
-                "python tools/kent_bridge_server.py", 12, GREEN, false), 10);
-        padded(content, text("Оставь Termux с запущенным сервером. Он слушает ТОЛЬКО 127.0.0.1:47883 " +
-                "и сохраняет токен в ~/.kent-bridge/token. При первой настройке прочитайте его через " +
-                "cat ~/.kent-bridge/token и вставьте в поле ниже. Токен хранится зашифрованно.", 12, MUTED, false), 10);
-        padded(content, text(localBridge.configured() ?
-                "● Локальный токен сохранён" : "○ Локальный токен не задан",
-                13, localBridge.configured() ? GREEN : GOLD, true), 9);
-        EditText tokenInput = field("Вставь 48 символов токена", "");
-        tokenInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        padded(content, tokenInput, 10);
-        Button saveToken = button("Сохранить токен локального моста", false);
-        padded(content, saveToken, 8);
-        saveToken.setOnClickListener(v -> {
-            try {
-                secrets.saveBridgeToken(tokenInput.getText().toString().trim());
-                tokenInput.setText("");
-                toast("Токен сохранён локально");
-                draw();
-            } catch (Exception e) {
-                toast("Ошибка токена: " + e.getMessage());
-            }
-        });
-
-        Button toggle = button(secrets.bridgeEnabled() ? "Отключить мост" : "Включить мост", true);
-        padded(content, toggle, 16);
-        toggle.setOnClickListener(v -> {
+        Button toggle = button(secrets.bridgeEnabled() ? "Отключить мост" : "Включить мост", false);
+        padded(content, toggle, 8);
+        toggle.setOnClickListener(view -> {
             if (secrets.bridgeEnabled()) {
                 secrets.bridgeEnabled(false);
-                draw();
+                headless.setAutoStartEnabled(false);
+                redrawBridgeAfterSetup();
                 return;
             }
             new AlertDialog.Builder(this)
                     .setTitle("Включить мост Termux?")
-                    .setMessage("Проверки выполняются с правами Termux или Shizuku. " +
-                            "Android сообщает о предоставленных разрешениях в настройках приложения.")
-                    .setPositiveButton("Включить", (d, w) -> { secrets.bridgeEnabled(true); draw(); })
+                    .setMessage("Команды запускаются с правами среды Termux. Запуск команды агентом требует подтверждения.")
+                    .setPositiveButton("Включить", (dialog, which) -> {
+                        secrets.bridgeEnabled(true);
+                        redrawBridgeAfterSetup();
+                    })
                     .setNegativeButton("Отмена", null).show();
         });
+        if (secrets.bridgeEnabled()) {
+            Button autoStart = button(headless.autoStartEnabled()
+                    ? "Фоновый запуск моста · включён" : "Разрешить фоновый запуск моста", false);
+            padded(content, autoStart, 6);
+            autoStart.setOnClickListener(view -> toggleHeadlessAutoStart());
+        }
 
-        Button testTermux = button("▶ Тест Termux: id", false);
-        padded(content, testTermux, 14);
-        testTermux.setOnClickListener(v -> testBridge(false));
-        Button testAdb = button("▶ Тест Shizuku: id", false);
-        padded(content, testAdb, 9);
-        testAdb.setOnClickListener(v -> testBridge(true));
-        Button manualCommand = button("Выполнить свою команду в Termux", false);
-        padded(content, manualCommand, 9);
-        manualCommand.setOnClickListener(v -> promptTermuxCommand());
-        Button stopBridge = button("■ Остановить ожидание", false);
-        padded(content, stopBridge, 9);
-        stopBridge.setOnClickListener(v -> {
-            stopRequested.set(true);
-            toast("Ожидание отменяется; выполняемая команда в Termux может продолжить работу.");
+        padded(content, text("Токен локального моста", 14, WHITE, true), 16);
+        boolean tokenSaved = localBridge.configured();
+        padded(content, text(tokenSaved ? "Токен сохранён на устройстве." : "Токен ещё не задан.",
+                12, tokenSaved ? GREEN : GOLD, false), 5);
+        EditText tokenInput = field("48 символов токена", "");
+        tokenInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        tokenInput.setImeOptions(android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
+        tokenInput.setSaveEnabled(false);
+        tokenInput.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        tokenInput.setSingleLine(true);
+        padded(content, tokenInput, 5);
+        Button saveToken = button("Сохранить токен", false);
+        padded(content, saveToken, 6);
+        saveToken.setOnClickListener(view -> {
+            try {
+                String value = tokenInput.getText().toString().trim();
+                if (value.isEmpty()) {
+                    tokenInput.setError("Вставьте токен из Termux.");
+                    return;
+                }
+                secrets.saveBridgeToken(value);
+                tokenInput.setText("");
+                toast("Токен сохранён локально");
+                redrawBridgeAfterSetup();
+            } catch (Exception e) {
+                tokenInput.setText("");
+                toast("Токен не сохранён. Проверьте формат.");
+            }
         });
-        padded(content, text("Последний результат", 13, MUTED, true), 16);
-        padded(content, text(lastBridgeResult, 12, WHITE, false), 7);
-        padded(content, text("Остановка ожидания не завершает уже запущенный процесс Termux.",
-                12, MUTED, false), 10);
+
+        padded(content, text("Ручная диагностика", 14, WHITE, true), 16);
+        LinearLayout tests = new LinearLayout(this);
+        addControl(tests, "Termux · id", false, () -> testBridge(false));
+        addControl(tests, "Shizuku · id", false, () -> testBridge(true));
+        padded(content, tests, 6);
+        padded(content, actionButton("Выполнить свою команду в Termux", this::promptTermuxCommand), 6);
+        if (running && activeAgent == null) {
+            padded(content, actionButton("Остановить ожидание", () -> {
+                stopRequested.set(true);
+                toast("Ожидание остановится. Уже запущенная команда может продолжиться.");
+            }), 6);
+        }
+        TextView result = text(lastBridgeResult, 12, WHITE, false);
+        result.setTextIsSelectable(true);
+        padded(content, result, 9);
+
+        updateHeadlessView();
+        if (termuxScrollY > 0) scroll.post(() -> scroll.scrollTo(0, termuxScrollY));
+        if (opened && resumed) refreshHeadless(false);
+    }
+
+    private void addTermuxControl(LinearLayout row, Button item) {
+        item.setMinimumWidth(0);
+        item.setMinWidth(0);
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, dp(48), 1);
+        if (row.getChildCount() > 0) size.leftMargin = dp(6);
+        row.addView(item, size);
+    }
+
+    private void redrawBridgeAfterSetup() {
+        draw();
+        refreshHeadless(false);
+    }
+
+    private void refreshHeadless(boolean start) {
+        if (isFinishing() || isDestroyed()) return;
+        if (headlessStarting && !start && secrets.bridgeEnabled()) return;
+        int request = ++headlessProbeGeneration;
+        if (headlessProbe != null) headlessProbe.cancel(true);
+        headlessChecking = true;
+        headlessStarting = start;
+        headlessCheckError = "";
+        updateHeadlessView();
+        headlessProbe = termuxUiExecutor.submit(() -> {
+            try {
+                HeadlessTermux.Status result = start
+                        ? headless.connect(true, Thread.currentThread()::isInterrupted)
+                        : headless.check(Thread.currentThread()::isInterrupted);
+                runOnUiThread(() -> finishHeadlessCheck(request, result, ""));
+            } catch (RuntimeException error) {
+                runOnUiThread(() -> finishHeadlessCheck(request, null, "Не удалось проверить Termux."));
+            }
+        });
+    }
+
+    private void finishHeadlessCheck(int request, HeadlessTermux.Status result, String error) {
+        if (request != headlessProbeGeneration || isFinishing() || isDestroyed()) return;
+        headlessStatus = result;
+        headlessCheckError = error;
+        headlessChecking = false;
+        headlessStarting = false;
+        updateHeadlessView();
+    }
+
+    private void updateHeadlessView() {
+        if (headlessStatusView == null) return;
+        String state = "Ожидание проверки Termux.";
+        int color = MUTED;
+        if (headlessChecking) {
+            state = headlessStarting ? "Подключение к мосту Termux…" : "Проверка Termux…";
+        } else if (headlessStatus != null) {
+            state = headlessStatus.detail + "\nTermux " + (headlessStatus.installed ? "установлен" : "не найден")
+                    + "  ·  RUN_COMMAND " + (headlessStatus.runCommandAvailable ? "доступен" : "недоступен")
+                    + (headlessStatus.permission ? " (разрешён)" : " (без разрешения)");
+            color = headlessStatus.localStatus == LocalTermuxBridge.Health.Status.READY ? GREEN
+                    : headlessStatus.officialAvailable() ? MUTED : GOLD;
+        } else if (!headlessCheckError.isEmpty()) {
+            state = headlessCheckError;
+            color = GOLD;
+        }
+        headlessStatusView.setText(state);
+        headlessStatusView.setTextColor(color);
+        headlessRefresh.setEnabled(!headlessChecking);
+        headlessConnect.setEnabled(!headlessChecking && secrets.bridgeEnabled());
+        headlessPermission.setVisibility(bridge.hasPermission() ? View.GONE : View.VISIBLE);
+    }
+
+    private void requestHeadlessConnection() {
+        if (headless.autoStartEnabled()) {
+            refreshHeadless(true);
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("Запустить локальный мост?")
+                .setMessage("При необходимости Kent попросит Termux запустить ~/.kent-bridge/server.py в фоне.")
+                .setNegativeButton("Отмена", null)
+                .setPositiveButton("Подключить", (dialog, which) -> refreshHeadless(true)).show();
+    }
+
+    private void toggleHeadlessAutoStart() {
+        if (headless.autoStartEnabled()) {
+            headless.setAutoStartEnabled(false);
+            draw();
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("Разрешить фоновый запуск моста?")
+                .setMessage("Если локальный мост остановлен, Kent сможет запустить установленный ~/.kent-bridge/server.py "
+                        + "через RUN_COMMAND, пока Kent открыт. Команды агента по-прежнему требуют подтверждения.")
+                .setNegativeButton("Отмена", null)
+                .setPositiveButton("Разрешить", (dialog, which) -> {
+                    headless.setAutoStartEnabled(true);
+                    draw();
+                }).show();
+    }
+
+    private void showTermuxSetup() {
+        LinearLayout content = vertical();
+        content.setPadding(dp(14), dp(4), dp(14), dp(12));
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(content);
+        padded(content, text("Остановите старый сервер Ctrl+C, если мост 0.8 ещё работает. "
+                + "Установите мост 0.9 в домашнюю папку Termux.", 13, WHITE, false), 4);
+        termuxSetupCommand(content, "Скопировать установку",
+                "pkg install -y python curl && mkdir -p \"$HOME/.kent-bridge\" && (\n" +
+                        "  umask 077\n" +
+                        "  tmp=$(mktemp \"$HOME/.kent-bridge/server.XXXXXX\") || exit\n" +
+                        "  trap 'rm -f -- \"$tmp\"' EXIT\n" +
+                        "  curl --proto '=https' --proto-redir '=https' -fSL '" +
+                        "https://raw.githubusercontent.com/slavalukanov59-debug/kent-code-android/" +
+                        "0811a4e815ac6d9aec726bba5703971979fb3556/tools/kent_bridge_server.py' -o \"$tmp\" &&\n" +
+                        "  mv -f -- \"$tmp\" \"$HOME/.kent-bridge/server.py\"\n" +
+                        ")");
+        padded(content, text("Для фонового запуска включите внешние команды в Termux, затем выдайте "
+                + "RUN_COMMAND в Kent. Если Android не покажет запрос, откройте дополнительные разрешения Kent "
+                + "в настройках Android.", 13, WHITE, false), 12);
+        termuxSetupCommand(content, "Скопировать настройку RUN_COMMAND",
+                "mkdir -p \"$HOME/.termux\" &&\n" +
+                        "printf '\\nallow-external-apps=true\\n' >> \"$HOME/.termux/termux.properties\" &&\n" +
+                        "termux-reload-settings");
+        padded(content, text("Запустите мост вручную один раз, чтобы получить токен. "
+                + "Если RUN_COMMAND недоступен, повторяйте эту команду при остановке моста.", 13, WHITE, false), 12);
+        termuxSetupCommand(content, "Скопировать ручной запуск", "python \"$HOME/.kent-bridge/server.py\"");
+        padded(content, text("При первом запуске мост создаёт токен. Прочитайте его в отдельном сеансе Termux "
+                + "и вставьте в поле «Токен локального моста». Kent хранит его зашифрованным. "
+                + "Вернитесь в Kent и нажмите «Проверить».", 13, WHITE, false), 12);
+        termuxSetupCommand(content, "Скопировать команду чтения токена", "cat \"$HOME/.kent-bridge/token\"");
+        new AlertDialog.Builder(this).setTitle("Настройка Termux").setView(scroll)
+                .setNegativeButton("Закрыть", null)
+                .setPositiveButton("Открыть Termux", (dialog, which) -> openTermux()).show();
+    }
+
+    private void termuxSetupCommand(LinearLayout content, String buttonLabel, String command) {
+        TextView code = text(command, 12, GREEN, false);
+        code.setTypeface(Typeface.MONOSPACE);
+        code.setTextIsSelectable(true);
+        padded(content, code, 5);
+        padded(content, actionButton(buttonLabel, () -> {
+            ClipboardManager clipboard = getSystemService(ClipboardManager.class);
+            if (clipboard == null) {
+                toast("Буфер обмена недоступен.");
+                return;
+            }
+            clipboard.setPrimaryClip(ClipData.newPlainText("Команда Termux", command));
+            toast("Команда скопирована.");
+        }), 4);
+    }
+
+    private void openTermux() {
+        Intent launch = getPackageManager().getLaunchIntentForPackage("com.termux");
+        if (launch != null) {
+            try {
+                startActivity(launch);
+                return;
+            } catch (ActivityNotFoundException | SecurityException ignored) { }
+        }
+        toast("Не удалось открыть Termux. Проверьте, установлено ли приложение.");
     }
 
     private void promptTermuxCommand() {
@@ -1554,8 +1758,6 @@ public final class MainActivity extends Activity {
     private void executeBridge(String command, boolean adb, String directory, int seconds) {
         if (taskRunning()) { toast("Приостановите текущую задачу."); return; }
         if (!secrets.bridgeEnabled()) { toast("Включите мост Termux."); return; }
-        boolean local = localBridge.configured();
-        if (!local && !bridge.hasPermission()) { toast("Добавьте локальный токен или разрешение RUN_COMMAND."); return; }
         running = true;
         stopRequested.set(false);
         lastBridgeResult = adb ? "Проверяется текущий UID Shizuku…" : "Ожидается результат Termux…";
@@ -1563,30 +1765,36 @@ public final class MainActivity extends Activity {
         executor.submit(() -> {
             String result;
             try {
-                CommandResult completed = local
-                        ? localBridge.runResult(command, adb, directory, seconds, stopRequested::get)
-                        : bridge.runResult(command, adb, directory, seconds, stopRequested::get);
-                result = SensitiveData.redact(completed.display());
-            } catch (IOException e) {
-                result = "Ошибка моста: " + SensitiveData.redact(e.getMessage() == null ? "нет результата" : e.getMessage());
+                HeadlessTermux.Status route = headless.connect(headless.autoStartEnabled(), stopRequested::get);
+                if (stopRequested.get()) {
+                    result = "Ожидание отменено до отправки команды.";
+                } else if (route.localReady()) {
+                    result = localBridge.runResult(command, adb, directory, seconds, stopRequested::get).display();
+                } else if (route.officialAvailable()) {
+                    result = bridge.runResult(command, adb, directory, seconds, stopRequested::get).display();
+                } else {
+                    result = route.detail;
+                }
+            } catch (IOException | RuntimeException e) {
+                result = "Ошибка моста. " + (e.getMessage() == null ? "Результат недоступен." : e.getMessage());
             }
-            final String output = result;
+            final String output = cleanPrompt(result);
             runOnUiThread(() -> {
                 running = false;
                 lastBridgeResult = output;
                 if (isDestroyed()) return;
                 updateChatRunningState();
-                if (tab == 2) draw();
+                if (termuxPaneVisible()) redrawBridgeAfterSetup();
             });
         });
     }
 
     @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
-        if (requestCode == 403) {
+        if (requestCode == 403 && bridge != null) {
             toast(bridge.hasPermission() ? "Разрешение Termux получено" :
                     "Не разрешено. Проверь дополнительные разрешения KENT CODE RED в настройках Android.");
-            if (tab == 2) draw();
+            if (termuxPaneVisible()) redrawBridgeAfterSetup();
         }
     }
 
@@ -2273,6 +2481,8 @@ public final class MainActivity extends Activity {
         executor.shutdown();
         creditExecutor.shutdownNow();
         workspaceBrowserExecutor.shutdownNow();
+        if (headlessProbe != null) headlessProbe.cancel(true);
+        termuxUiExecutor.shutdownNow();
         if (workspaceExportDialog != null) workspaceExportDialog.dismiss();
         if (workspaceExport != null) {
             workspaceExport.listen(null);

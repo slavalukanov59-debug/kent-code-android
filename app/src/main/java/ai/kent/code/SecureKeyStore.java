@@ -180,6 +180,9 @@ public final class SecureKeyStore {
     public boolean bridgeEnabled() { return prefs.getBoolean("termux_bridge_enabled", false); }
     public void bridgeEnabled(boolean enabled) { prefs.edit().putBoolean("termux_bridge_enabled", enabled).apply(); }
 
+    boolean bridgeAutoStart() { return prefs.getBoolean("termux_bridge_auto_start", false); }
+    void bridgeAutoStart(boolean enabled) { prefs.edit().putBoolean("termux_bridge_auto_start", enabled).apply(); }
+
     /** Explicit opt-in for text writes within the default workspace on a new mission. */
     public boolean autopilotEnabled() { return prefs.getBoolean("autopilot_enabled", false); }
     public void autopilotEnabled(boolean enabled) {

@@ -15,6 +15,9 @@ final class KentLocalData {
     final MissionStore missions;
     final ProjectService projects;
     final DiagnosticsStore diagnostics;
+    final TermuxBridge officialTermux;
+    final LocalTermuxBridge localTermux;
+    final HeadlessTermux headless;
     final TerminalTools terminal;
 
     private KentLocalData(Context context) throws IOException {
@@ -25,7 +28,10 @@ final class KentLocalData {
         missions = new MissionStore(context);
         projects = new ProjectService(workspace, context.getCacheDir());
         diagnostics = new DiagnosticsStore(context.getFilesDir());
-        terminal = new TerminalTools(keys, new TermuxBridge(context), new LocalTermuxBridge(keys), diagnostics,
+        officialTermux = new TermuxBridge(context);
+        localTermux = new LocalTermuxBridge(keys);
+        headless = new HeadlessTermux(keys, officialTermux, localTermux);
+        terminal = new TerminalTools(keys, officialTermux, localTermux, headless, diagnostics,
                 context.getCacheDir());
         if (!missions.loadFailed()) missions.recoverInterrupted();
         tokens.recoverInterrupted();

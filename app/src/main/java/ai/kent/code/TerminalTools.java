@@ -19,6 +19,7 @@ final class TerminalTools {
     private final SecureKeyStore secrets;
     private final TermuxBridge official;
     private final LocalTermuxBridge loopback;
+    private final HeadlessTermux headless;
     private final DiagnosticsStore diagnostics;
     private final File cache;
     private final ExecutorService worker = Executors.newSingleThreadExecutor(task -> {
@@ -28,11 +29,12 @@ final class TerminalTools {
     });
     private Job active;
 
-    TerminalTools(SecureKeyStore secrets, TermuxBridge official, LocalTermuxBridge loopback,
+    TerminalTools(SecureKeyStore secrets, TermuxBridge official, LocalTermuxBridge loopback, HeadlessTermux headless,
                   DiagnosticsStore diagnostics, File cache) {
         this.secrets = secrets;
         this.official = official;
         this.loopback = loopback;
+        this.headless = headless;
         this.diagnostics = diagnostics;
         this.cache = cache;
     }
@@ -64,7 +66,8 @@ final class TerminalTools {
 
     static void addTools(JSONArray tools) throws JSONException {
         add(tools, "terminal_check",
-                "Report Termux permission/configuration. probe=true requests approval to run real version checks for installed tools.",
+                "Check live authenticated Termux bridge status and Android permission without running commands. "
+                        + "probe=true requests approval to run real version checks for installed tools.",
                 new JSONObject().put("probe", property("boolean")));
         add(tools, "terminal_run",
                 "Request approval for one exact Termux diagnostic. program/check: python3 syntax (one .py) or tests (unittest discovery); " +
@@ -100,19 +103,18 @@ final class TerminalTools {
     }
 
     private JSONObject check(boolean probe, KentAgent.Events events, String missionId) throws Exception {
-        boolean enabled = secrets.bridgeEnabled();
-        boolean installed = official.installed();
-        boolean permission = official.hasPermission();
-        boolean local = loopback.configured();
-        boolean configured = enabled && (local || installed && permission);
-        JSONObject availability = new JSONObject().put("bridge_enabled", enabled).put("termux_installed", installed)
-                .put("run_command_permission", permission).put("local_configured", local)
-                .put("transport_configured", configured);
-        if (!probe || !configured) {
+        HeadlessTermux.Status connection = headless.connect(probe && headless.autoStartEnabled(), events::cancelled);
+        boolean local = connection.localReady();
+        boolean ready = local || connection.officialAvailable();
+        JSONObject availability = new JSONObject().put("bridge_enabled", connection.enabled)
+                .put("termux_installed", connection.installed).put("run_command_permission", connection.permission)
+                .put("run_command_service", connection.runCommandAvailable).put("local_configured", connection.tokenConfigured)
+                .put("local_status", connection.localStatus.name()).put("local_ready", local)
+                .put("transport_configured", connection.enabled && (connection.tokenConfigured || connection.officialAvailable()))
+                .put("local_transport_verified", local).put("official_transport_eligible", connection.officialAvailable());
+        if (!probe || !ready || events.cancelled()) {
             return availability.put("ok", true).put("status", "CONFIGURATION").put("versions_checked", false)
-                    .put("detail", configured
-                            ? "probe=true запускает проверку версий после подтверждения."
-                            : "Настройте локальный мост либо включите Termux с разрешением RUN_COMMAND.");
+                    .put("detail", connection.detail + (ready ? " Проверка версий требует подтверждения." : ""));
         }
 
         StringBuilder commands = new StringBuilder();
@@ -123,7 +125,8 @@ final class TerminalTools {
             commands.append(command.display()).append('\n');
         }
         String[] privateValues = secrets.exportSecrets();
-        if (!events.approve("Проверить версии инструментов Termux?", "Каталог Termux: ~\n\n" + commands))
+        String route = local ? "Локальный мост" : "Служба Termux RUN_COMMAND";
+        if (!events.approve("Проверить версии инструментов Termux?", route + "\nКаталог Termux: ~\n\n" + commands))
             return availability.put("ok", false).put("status", "DENIED").put("versions_checked", false);
         Job job = start(missionId, commands.toString(), "~", privateValues, events, current -> {
             current.running("");
@@ -164,12 +167,8 @@ final class TerminalTools {
         String source = args.optString("source", workspace != null && !command.check.equals("version") ? "project" : "termux");
         if (!source.equals("project") && !source.equals("termux")) return rejected("Укажите рабочую папку проекта или Termux.");
         boolean project = source.equals("project");
-        boolean local = loopback.configured();
-        if (project && (workspace == null || !local))
-            return rejected("Откройте проект и настройте локальный мост Termux для проверки его файлов.");
+        if (project && workspace == null) return rejected("Откройте проект для проверки его файлов.");
         if (!project && command.needsSnapshot) return rejected("Этой проверке нужна временная копия открытого проекта.");
-        if (!local && (!official.installed() || !official.hasPermission()))
-            return rejected("Termux или разрешение RUN_COMMAND недоступны.");
         String directory = checkedDirectory(args.optString("work_dir", "."));
         String selected = checkedDirectory(args.optString("snapshot_path", "."));
         if (!project && !selected.equals(".")) return rejected("snapshot_path относится к открытому проекту.");
@@ -191,7 +190,13 @@ final class TerminalTools {
             for (String input : inputs) if (!input.equals(redact(input, privateValues)))
                 return rejected("Путь содержит данные, похожие на секрет.");
         }
+        HeadlessTermux.Status connection = headless.connect(headless.autoStartEnabled(), events::cancelled);
+        if (events.cancelled()) return rejected(connection.detail);
+        boolean local = connection.localReady();
+        if (project && !local) return rejected("Для передачи копии проекта нужен локальный мост. " + connection.detail);
+        if (!local && !connection.officialAvailable()) return rejected(connection.detail);
         String preview = "Рабочий каталог: " + folder + "\nТаймаут: " + timeout + " с\n\n" + display;
+        preview = (local ? "Локальный мост\n" : "Служба Termux RUN_COMMAND\n") + preview;
         if (command.runsProjectCode) preview += "\n\nКоманда выполняет код проекта с правами Termux.";
         if (!local) preview += "\n\nОтмена официального моста прекращает ожидание результата. Команду ограничивает таймаут Termux.";
         if (!events.approve("Выполнить проверку в Termux?", preview))
